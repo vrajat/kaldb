@@ -171,12 +171,12 @@ public class ReplicaCreationService extends AbstractScheduledService {
       AtomicInteger successCounter = new AtomicInteger(0);
       List<ListenableFuture<?>> createdReplicaMetadataList =
           snapshotMetadataStore.listSync().stream()
-              // only attempt to create replicas for snapshots that have not expired, not live, and
-              // do not already exist
+              // only attempt to create replicas for snapshots that have not expired, are
+              // assignable, and do not already exist
               .filter(
                   snapshotMetadata ->
                       snapshotMetadata.endTimeEpochMs > snapshotExpiration
-                          && !snapshotMetadata.isLive()
+                          && isAssignableSnapshot(snapshotMetadata)
                           && !existingReplicas.contains(snapshotMetadata.snapshotId))
               .map(
                   (snapshotMetadata) -> {
@@ -249,5 +249,13 @@ public class ReplicaCreationService extends AbstractScheduledService {
         Instant.now().toEpochMilli(),
         expireAfter.toEpochMilli(),
         isRestored);
+  }
+
+  /** Returns true when a snapshot has enough metadata to be assigned to cache nodes. */
+  public static boolean isAssignableSnapshot(SnapshotMetadata snapshotMetadata) {
+    if (!snapshotMetadata.isLive()) {
+      return true;
+    }
+    return !snapshotMetadata.snapshotPath.isBlank() && snapshotMetadata.snapshotGeneration > 0;
   }
 }

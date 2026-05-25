@@ -225,7 +225,7 @@ public class ReplicaCreationServiceTest {
   }
 
   @Test
-  public void shouldNotCreateReplicasForLiveSnapshots() {
+  public void shouldNotCreateReplicasForLiveSnapshotsWithoutManifest() {
     SnapshotMetadata snapshotNotLive =
         new SnapshotMetadata(
             "a", Instant.now().toEpochMilli() - 1, Instant.now().toEpochMilli(), 0, "a", 100);
@@ -281,6 +281,50 @@ public class ReplicaCreationServiceTest {
                 ReplicaCreationService.REPLICA_ASSIGNMENT_TIMER, meterRegistry))
         .isEqualTo(1);
     assertThat(replicaMetadataStore.listSync().stream().filter(r -> r.isRestored).count()).isZero();
+  }
+
+  @Test
+  public void shouldCreateReplicasForLiveSnapshotsWithManifest() {
+    SnapshotMetadata liveSnapshot =
+        new SnapshotMetadata(
+            "live-a",
+            Instant.now().toEpochMilli() - 1,
+            Instant.now().toEpochMilli(),
+            10,
+            "partition-a",
+            0,
+            SnapshotMetadata.SnapshotType.LIVE,
+            SnapshotMetadata.IndexType.LUCENE,
+            "nrt/v1/partitions/partition-a/chunks/live-a/manifests/00000000000000000001-node.json",
+            1,
+            SnapshotMetadata.DEFAULT_VERSION);
+    snapshotMetadataStore.createSync(liveSnapshot);
+
+    AstraConfigs.ManagerConfig.ReplicaCreationServiceConfig replicaCreationServiceConfig =
+        AstraConfigs.ManagerConfig.ReplicaCreationServiceConfig.newBuilder()
+            .addAllReplicaSets(List.of("rep1", "rep2"))
+            .setSchedulePeriodMins(10)
+            .setReplicaLifespanMins(1440)
+            .build();
+
+    AstraConfigs.ManagerConfig managerConfig =
+        AstraConfigs.ManagerConfig.newBuilder()
+            .setReplicaCreationServiceConfig(replicaCreationServiceConfig)
+            .setEventAggregationSecs(2)
+            .setScheduleInitialDelayMins(0)
+            .build();
+
+    ReplicaCreationService replicaCreationService =
+        new ReplicaCreationService(
+            replicaMetadataStore, snapshotMetadataStore, managerConfig, meterRegistry);
+
+    Map<String, Integer> replicasCreated =
+        replicaCreationService.createReplicasForUnassignedSnapshots();
+
+    assertThat(replicasCreated.values().stream().mapToInt(i -> i).sum()).isEqualTo(2);
+    await().until(() -> replicaMetadataStore.listSync().size() == 2);
+    assertThat(replicaMetadataStore.listSync())
+        .allMatch(replicaMetadata -> replicaMetadata.snapshotId.equals(liveSnapshot.snapshotId));
   }
 
   @Test

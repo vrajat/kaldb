@@ -38,6 +38,7 @@ public class RecoveryChunkImpl<T> extends ReadWriteChunk<T> {
         snapshotMetadataStore,
         searchContext,
         kafkaPartitionId,
+        false,
         LOG);
   }
 

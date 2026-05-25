@@ -323,7 +323,8 @@ public class IndexingChunkManager<T> extends ChunkManagerBase<T> {
               searchMetadataStore,
               snapshotMetadataStore,
               searchContext,
-              kafkaPartitionId);
+              kafkaPartitionId,
+              indexerConfig.getNrtEnabled());
       chunkMap.put(newChunk.id(), newChunk);
       activeNrtStartOffsetInclusive = OptionalLong.empty();
       // Register the chunk, so we can search it.

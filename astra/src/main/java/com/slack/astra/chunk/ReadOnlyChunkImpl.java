@@ -5,6 +5,9 @@ import static com.slack.astra.server.AstraConfig.DEFAULT_ZK_TIMEOUT_SECS;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.slack.astra.blobfs.BlobStore;
+import com.slack.astra.blobfs.nrt.NrtBlobStore;
+import com.slack.astra.blobfs.nrt.NrtBlobStore.FileEntry;
+import com.slack.astra.blobfs.nrt.NrtBlobStore.NrtManifest;
 import com.slack.astra.logstore.search.AstraSearcherManager;
 import com.slack.astra.logstore.search.LogIndexSearcher;
 import com.slack.astra.logstore.search.LogIndexSearcherImpl;
@@ -31,8 +34,10 @@ import io.micrometer.core.instrument.Timer;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.EnumSet;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -79,6 +84,7 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
   private CacheNodeAssignmentStore cacheNodeAssignmentStore;
   private final MeterRegistry meterRegistry;
   private final BlobStore blobStore;
+  private final NrtBlobStore nrtBlobStore;
 
   public static final String CHUNK_ASSIGNMENT_TIMER = "chunk_assignment_timer";
   public static final String CHUNK_EVICTION_TIMER = "chunk_eviction_timer";
@@ -91,11 +97,61 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
 
   private final AstraMetadataStoreChangeListener<CacheSlotMetadata> cacheSlotListener =
       this::cacheNodeListener;
+  private final AstraMetadataStoreChangeListener<SnapshotMetadata> liveSnapshotListener =
+      this::liveSnapshotListener;
 
   private final ReentrantLock chunkAssignmentLock = new ReentrantLock();
+  private boolean liveSnapshotListenerRegistered;
 
   private static final boolean USE_S3_STREAMING =
       Boolean.parseBoolean(System.getProperty(ASTRA_S3_STREAMING_FLAG, "false"));
+
+  private static void validateManifest(
+      SnapshotMetadata liveSnapshotMetadata, NrtManifest manifest) {
+    if (manifest == null) {
+      throw new IllegalArgumentException(
+          "NRT manifest not found for " + liveSnapshotMetadata.snapshotPath);
+    }
+    if (!liveSnapshotMetadata.snapshotId.equals(manifest.snapshotId())
+        || !liveSnapshotMetadata.partitionId.equals(manifest.partitionId())
+        || liveSnapshotMetadata.snapshotGeneration != manifest.manifestGeneration()
+        || liveSnapshotMetadata.maxOffset != manifest.maxIndexedOffsetInclusive()) {
+      throw new IllegalArgumentException(
+          String.format(
+              "NRT manifest does not match live snapshot metadata manifest=%s metadata=%s",
+              manifest, liveSnapshotMetadata));
+    }
+  }
+
+  private static void validateManifestFiles(Path stagingDirectory, NrtManifest manifest)
+      throws Exception {
+    validateFileEntry(stagingDirectory, manifest.schemaFile());
+    for (FileEntry fileEntry : manifest.files()) {
+      validateFileEntry(stagingDirectory, fileEntry);
+    }
+  }
+
+  private static void validateFileEntry(Path stagingDirectory, FileEntry fileEntry)
+      throws Exception {
+    Path filePath = stagingDirectory.resolve(fileEntry.name());
+    if (!Files.exists(filePath)
+        || Files.size(filePath) != fileEntry.length()
+        || !checksum(filePath).equals(fileEntry.checksum())) {
+      throw new IllegalArgumentException("Invalid NRT manifest file " + fileEntry);
+    }
+  }
+
+  private static String checksum(Path filePath) throws Exception {
+    MessageDigest digest = MessageDigest.getInstance("SHA-256");
+    try (var inputStream = Files.newInputStream(filePath)) {
+      byte[] buffer = new byte[8192];
+      int bytesRead;
+      while ((bytesRead = inputStream.read(buffer)) != -1) {
+        digest.update(buffer, 0, bytesRead);
+      }
+    }
+    return HexFormat.of().formatHex(digest.digest());
+  }
 
   public ReadOnlyChunkImpl(
       AsyncCuratorFramework curatorFramework,
@@ -149,6 +205,7 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
       throws Exception {
     this.meterRegistry = meterRegistry;
     this.blobStore = blobStore;
+    this.nrtBlobStore = new NrtBlobStore(blobStore);
     this.dataDirectoryPrefix = dataDirectoryPrefix;
     this.searchContext = searchContext;
     this.slotId = UUID.randomUUID().toString();
@@ -209,6 +266,7 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
       logSearcher = null;
 
       cleanDirectory();
+      unregisterLiveSnapshotListener();
 
       // delete assignment
       cacheNodeAssignmentStore.deleteSync(cacheNodeAssignment);
@@ -229,6 +287,11 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
   }
 
   public void downloadChunkData() {
+    if (snapshotMetadata.isLive()) {
+      downloadLiveChunkData();
+      return;
+    }
+
     Timer.Sample assignmentTimer = Timer.start(meterRegistry);
     // lock
     chunkAssignmentLock.lock();
@@ -309,6 +372,118 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
       assignmentTimer.stop(chunkAssignmentTimerFailure);
     } finally {
       chunkAssignmentLock.unlock();
+    }
+  }
+
+  private void downloadLiveChunkData() {
+    Timer.Sample assignmentTimer = Timer.start(meterRegistry);
+    try {
+      registerLiveSnapshotListener();
+      SnapshotMetadata currentSnapshotMetadata =
+          snapshotMetadataStore.getSync(snapshotMetadata.getPartition(), snapshotMetadata.name);
+      applyLiveSnapshot(
+          currentSnapshotMetadata != null
+                  && currentSnapshotMetadata.isLive()
+                  && currentSnapshotMetadata.snapshotGeneration
+                      >= snapshotMetadata.snapshotGeneration
+              ? currentSnapshotMetadata
+              : snapshotMetadata);
+      assignmentTimer.stop(chunkAssignmentTimerSuccess);
+    } catch (Exception e) {
+      unregisterLiveSnapshotListener();
+      setAssignmentState(
+          getCacheNodeAssignment(), Metadata.CacheNodeAssignment.CacheNodeAssignmentState.EVICT);
+      LOG.error("Error handling live chunk assignment", e);
+      assignmentTimer.stop(chunkAssignmentTimerFailure);
+    }
+  }
+
+  private void liveSnapshotListener(SnapshotMetadata updatedSnapshotMetadata) {
+    if (snapshotMetadata != null
+        && snapshotMetadata.snapshotId.equals(updatedSnapshotMetadata.snapshotId)
+        && updatedSnapshotMetadata.isLive()
+        && updatedSnapshotMetadata.snapshotGeneration > snapshotMetadata.snapshotGeneration) {
+      try {
+        applyLiveSnapshot(updatedSnapshotMetadata);
+      } catch (Exception e) {
+        LOG.warn(
+            "Failed to apply live snapshot update snapshot={} generation={}",
+            updatedSnapshotMetadata.snapshotId,
+            updatedSnapshotMetadata.snapshotGeneration,
+            e);
+      }
+    }
+  }
+
+  private void applyLiveSnapshot(SnapshotMetadata liveSnapshotMetadata) throws Exception {
+    chunkAssignmentLock.lock();
+    try {
+      NrtManifest manifest = nrtBlobStore.readManifest(liveSnapshotMetadata.snapshotPath);
+      validateManifest(liveSnapshotMetadata, manifest);
+
+      Path stagingDirectory =
+          Path.of(
+              String.format(
+                  "%s/astra-nrt-%s-%020d",
+                  dataDirectoryPrefix,
+                  assignment.assignmentId,
+                  liveSnapshotMetadata.snapshotGeneration));
+      if (Files.isDirectory(stagingDirectory)) {
+        FileUtils.cleanDirectory(stagingDirectory.toFile());
+      }
+      blobStore.download(
+          String.format(
+              "nrt/v1/partitions/%s/chunks/%s/files",
+              manifest.partitionId(), manifest.snapshotId()),
+          stagingDirectory);
+      validateManifestFiles(stagingDirectory, manifest);
+
+      ChunkSchema nextChunkSchema =
+          ChunkSchema.deserializeFile(stagingDirectory.resolve(ReadWriteChunk.SCHEMA_FILE_NAME));
+      LogIndexSearcher<T> nextLogSearcher =
+          (LogIndexSearcher<T>)
+              new LogIndexSearcherImpl(
+                  new AstraSearcherManager(stagingDirectory), nextChunkSchema.fieldDefMap);
+
+      LogIndexSearcher<T> previousLogSearcher = logSearcher;
+      dataDirectory = stagingDirectory;
+      chunkSchema = nextChunkSchema;
+      chunkInfo = ChunkInfo.fromSnapshotMetadata(liveSnapshotMetadata);
+      logSearcher = nextLogSearcher;
+      snapshotMetadata = liveSnapshotMetadata;
+
+      if (previousLogSearcher != null) {
+        previousLogSearcher.close();
+      }
+
+      if (searchMetadata == null) {
+        searchMetadata =
+            registerSearchMetadata(searchMetadataStore, searchContext, liveSnapshotMetadata.name);
+      }
+
+      if (lastKnownAssignmentState != Metadata.CacheNodeAssignment.CacheNodeAssignmentState.LIVE) {
+        if (!setAssignmentState(
+            getCacheNodeAssignment(), Metadata.CacheNodeAssignment.CacheNodeAssignmentState.LIVE)) {
+          throw new InterruptedException("Failed to set live chunk assignment state");
+        }
+        lastKnownAssignmentState = Metadata.CacheNodeAssignment.CacheNodeAssignmentState.LIVE;
+      }
+    } finally {
+      chunkAssignmentLock.unlock();
+    }
+  }
+
+  private void registerLiveSnapshotListener() {
+    if (!liveSnapshotListenerRegistered) {
+      snapshotMetadataStore.addListener(liveSnapshotListener);
+      liveSnapshotListenerRegistered = true;
+    }
+  }
+
+  private void unregisterLiveSnapshotListener() {
+    if (liveSnapshotListenerRegistered) {
+      snapshotMetadataStore.removeListener(liveSnapshotListener);
+      liveSnapshotListenerRegistered = false;
     }
   }
 
@@ -507,6 +682,7 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
 
       // make this chunk un-queryable
       unregisterSearchMetadata();
+      unregisterLiveSnapshotListener();
 
       if (logSearcher != null) {
         logSearcher.close();
@@ -591,6 +767,7 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
 
   @Override
   public void close() throws IOException {
+    unregisterLiveSnapshotListener();
     cacheNodeMetadataStore.close();
     if (Boolean.getBoolean(ASTRA_NG_DYNAMIC_CHUNK_SIZES_FLAG)) {
       evictChunk(getCacheNodeAssignment());

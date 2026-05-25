@@ -83,6 +83,7 @@ public abstract class ReadWriteChunk<T> implements Chunk<T> {
   protected SnapshotMetadata liveSnapshotMetadata;
   protected final SnapshotMetadataStore snapshotMetadataStore;
   protected final SearchMetadataStore searchMetadataStore;
+  protected final boolean nrtEnabled;
   // TODO: Export file size uploaded as a metric.
   // TODO: Add chunk info as tags?.
 
@@ -97,6 +98,7 @@ public abstract class ReadWriteChunk<T> implements Chunk<T> {
       SnapshotMetadataStore snapshotMetadataStore,
       SearchContext searchContext,
       String kafkaPartitionId,
+      boolean nrtEnabled,
       Logger logger) {
     // TODO: Add checkArgument for the fields.
     this.logStore = logStore;
@@ -121,6 +123,7 @@ public abstract class ReadWriteChunk<T> implements Chunk<T> {
     liveSearchMetadata = toSearchMetadata(liveSnapshotMetadata.snapshotId, searchContext);
     this.searchMetadataStore = searchMetadataStore;
     this.snapshotMetadataStore = snapshotMetadataStore;
+    this.nrtEnabled = nrtEnabled;
     this.logger = logger;
     logger.info("Created a new index {} and chunk {}", logStore, chunkInfo);
   }
@@ -200,6 +203,9 @@ public abstract class ReadWriteChunk<T> implements Chunk<T> {
   /** Publishes the current live snapshot point for cache-side NRT refresh. */
   public SnapshotMetadata publishNrtSnapshot(
       NrtSnapshotPublisher publisher, long startOffsetInclusive) {
+    if (!nrtEnabled) {
+      throw new IllegalStateException("NRT publishing is disabled for chunk " + chunkInfo);
+    }
     SnapshotMetadata currentLiveSnapshotMetadata =
         new SnapshotMetadata(
             liveSnapshotMetadata.snapshotId,

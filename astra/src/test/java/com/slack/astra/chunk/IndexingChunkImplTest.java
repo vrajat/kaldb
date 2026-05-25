@@ -145,7 +145,8 @@ public class IndexingChunkImplTest {
               searchMetadataStore,
               snapshotMetadataStore,
               new SearchContext(TEST_HOST, TEST_PORT),
-              TEST_KAFKA_PARTITION_ID);
+              TEST_KAFKA_PARTITION_ID,
+              true);
 
       chunk.postCreate();
       closeChunk = true;
@@ -501,7 +502,8 @@ public class IndexingChunkImplTest {
               searchMetadataStore,
               snapshotMetadataStore,
               new SearchContext(TEST_HOST, TEST_PORT),
-              TEST_KAFKA_PARTITION_ID);
+              TEST_KAFKA_PARTITION_ID,
+              true);
 
       chunk.postCreate();
       closeChunk = true;
@@ -593,7 +595,8 @@ public class IndexingChunkImplTest {
               searchMetadataStore,
               snapshotMetadataStore,
               new SearchContext(TEST_HOST, TEST_PORT),
-              TEST_KAFKA_PARTITION_ID);
+              TEST_KAFKA_PARTITION_ID,
+              true);
       chunk.postCreate();
       closeChunk = true;
       List<SnapshotMetadata> snapshotNodes =
