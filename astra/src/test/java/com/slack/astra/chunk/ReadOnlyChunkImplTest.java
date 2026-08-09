@@ -1186,6 +1186,93 @@ public class ReadOnlyChunkImplTest {
   }
 
   @Test
+  public void shouldLoadLiveReplicaIntoMissingSlotDirectory() throws Exception {
+    AstraConfigs.AstraConfig AstraConfig = makeCacheConfig();
+    AstraConfigs.MetadataStoreConfig metadataStoreConfig =
+        AstraConfigs.MetadataStoreConfig.newBuilder()
+            .setMode(AstraConfigs.MetadataStoreMode.ZOOKEEPER_EXCLUSIVE)
+            .setZookeeperConfig(
+                AstraConfigs.ZookeeperConfig.newBuilder()
+                    .setZkConnectString(testingServer.getConnectString())
+                    .setZkPathPrefix("shouldLoadLiveReplicaIntoMissingSlotDirectory")
+                    .setZkSessionTimeoutMs(1000)
+                    .setZkConnectionTimeoutMs(1000)
+                    .setSleepBetweenRetriesMs(1000)
+                    .setZkCacheInitTimeoutMs(1000)
+                    .build())
+            .build();
+
+    AsyncCuratorFramework curatorFramework =
+        CuratorBuilder.build(meterRegistry, metadataStoreConfig.getZookeeperConfig());
+    ReplicaMetadataStore replicaMetadataStore =
+        new ReplicaMetadataStore(curatorFramework, metadataStoreConfig, meterRegistry);
+    SnapshotMetadataStore snapshotMetadataStore =
+        new SnapshotMetadataStore(curatorFramework, metadataStoreConfig, meterRegistry);
+    SearchMetadataStore searchMetadataStore =
+        new SearchMetadataStore(curatorFramework, metadataStoreConfig, meterRegistry, true);
+    CacheSlotMetadataStore cacheSlotMetadataStore =
+        new CacheSlotMetadataStore(curatorFramework, metadataStoreConfig, meterRegistry);
+    CacheNodeAssignmentStore cacheNodeAssignmentStore =
+        new CacheNodeAssignmentStore(curatorFramework, metadataStoreConfig, meterRegistry);
+    CacheNodeMetadataStore cacheNodeMetadataStore =
+        new CacheNodeMetadataStore(curatorFramework, metadataStoreConfig, meterRegistry);
+
+    String replicaId = "live-slot-replica";
+    String snapshotId = "live-slot-snapshot";
+    String assignmentId = "live-slot-assignment";
+    String cacheNodeId = "live-slot-cache-node";
+    String replicaSet = "rep1";
+
+    initializeZkReplica(curatorFramework, metadataStoreConfig, replicaId, snapshotId);
+    initializeNrtBlobStorageWithIndex(snapshotMetadataStore, snapshotId, 10);
+    initializeCacheNodeAssignment(
+        cacheNodeAssignmentStore, assignmentId, snapshotId, cacheNodeId, replicaSet, replicaId);
+    initializeCacheNode(cacheNodeMetadataStore, cacheNodeId, "some-host.name", 1, replicaSet, true);
+
+    ReadOnlyChunkImpl<LogMessage> readOnlyChunk =
+        new ReadOnlyChunkImpl<>(
+            curatorFramework,
+            meterRegistry,
+            blobStore,
+            SearchContext.fromConfig(AstraConfig.getCacheConfig().getServerConfig()),
+            AstraConfig.getS3Config().getS3Bucket(),
+            AstraConfig.getCacheConfig().getDataDirectory(),
+            AstraConfig.getCacheConfig().getReplicaSet(),
+            cacheSlotMetadataStore,
+            replicaMetadataStore,
+            snapshotMetadataStore,
+            searchMetadataStore,
+            cacheNodeAssignmentStore,
+            cacheNodeAssignmentStore.getSync(cacheNodeId, assignmentId),
+            snapshotMetadataStore.findSync(snapshotId),
+            cacheNodeMetadataStore);
+
+    await()
+        .until(
+            () ->
+                readOnlyChunk.getChunkMetadataState()
+                    == Metadata.CacheSlotMetadata.CacheSlotState.FREE);
+
+    Path slotDirectory =
+        Path.of(
+            String.format(
+                "%s/astra-slot-%s", AstraConfig.getCacheConfig().getDataDirectory(), replicaId));
+    assertThat(java.nio.file.Files.exists(slotDirectory)).isFalse();
+
+    assignReplicaToChunk(cacheSlotMetadataStore, replicaId, readOnlyChunk);
+
+    await()
+        .until(
+            () ->
+                readOnlyChunk.getChunkMetadataState()
+                    == Metadata.CacheSlotMetadata.CacheSlotState.LIVE);
+    assertThat(queryAll(readOnlyChunk).hits.size()).isEqualTo(10);
+
+    readOnlyChunk.close();
+    curatorFramework.unwrap().close();
+  }
+
+  @Test
   public void shouldRejectLiveNrtManifestGenerationMismatch() throws Exception {
     AstraConfigs.AstraConfig AstraConfig = makeCacheConfig();
     AstraConfigs.MetadataStoreConfig metadataStoreConfig =

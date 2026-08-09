@@ -5,6 +5,7 @@ import com.slack.astra.proto.config.AstraConfigs;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Duration;
+import java.util.Locale;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -77,7 +78,15 @@ public class S3AsyncUtil {
       if (notNullOrEmpty(config.getS3EndPoint())) {
         String endpoint = config.getS3EndPoint();
         try {
-          s3AsyncClient.endpointOverride(new URI(endpoint));
+          URI endpointUri = new URI(endpoint);
+          s3AsyncClient.endpointOverride(endpointUri);
+          if (shouldUseS3CompatibleEndpointMode(endpointUri)) {
+            LOG.info(
+                "Enabling S3-compatible endpoint mode for '{}': forcePathStyle=true checksumValidationEnabled=false",
+                endpointUri);
+            s3AsyncClient.forcePathStyle(true);
+            s3AsyncClient.checksumValidationEnabled(false);
+          }
         } catch (URISyntaxException e) {
           throw new RuntimeException(e);
         }
@@ -90,5 +99,16 @@ public class S3AsyncUtil {
 
   static boolean notNullOrEmpty(String target) {
     return target != null && !target.isEmpty();
+  }
+
+  static boolean shouldUseS3CompatibleEndpointMode(URI endpointUri) {
+    String host = endpointUri.getHost();
+    if (!notNullOrEmpty(host)) {
+      return false;
+    }
+    String normalizedHost = host.toLowerCase(Locale.ROOT);
+    return !(normalizedHost.equals("s3.amazonaws.com")
+        || normalizedHost.endsWith(".amazonaws.com")
+        || normalizedHost.endsWith(".amazonaws.com.cn"));
   }
 }

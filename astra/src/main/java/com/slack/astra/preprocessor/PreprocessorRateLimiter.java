@@ -191,6 +191,18 @@ public class PreprocessorRateLimiter {
         if (serviceNamePattern.equals(MATCH_ALL_SERVICE)
             || serviceNamePattern.equals(MATCH_STAR_SERVICE)
             || index.equals(serviceNamePattern)) {
+          if (datasetMetadata.getThroughputBytes() <= 0) {
+            messagesDroppedCounterProvider
+                .withTags(getMeterTags(index, MessageDropReason.OVER_LIMIT))
+                .increment(docs.size());
+            bytesDroppedCounterProvider
+                .withTags(getMeterTags(index, MessageDropReason.OVER_LIMIT))
+                .increment(totalBytes);
+            LOG.debug(
+                "Message was dropped for dataset '{}' because throughput is not yet configured",
+                index);
+            return false;
+          }
           RateLimiter rateLimiter = rateLimiterMap.get(datasetMetadata.getName());
           if (rateLimiter.tryAcquire(totalBytes)) {
             return true;
@@ -229,7 +241,7 @@ public class PreprocessorRateLimiter {
                 DatasetMetadata::getName,
                 datasetMetadata -> {
                   double permitsPerSecond =
-                      (double) datasetMetadata.getThroughputBytes() / preprocessorCount;
+                      sanitizedPermitsPerSecond(datasetMetadata.getName(), datasetMetadata);
                   LOG.info(
                       "Rate limiter initialized for {} at {} bytes per second (target throughput {} / processorCount {})",
                       datasetMetadata.getName(),
@@ -238,6 +250,20 @@ public class PreprocessorRateLimiter {
                       preprocessorCount);
                   return smoothBurstyRateLimiter(permitsPerSecond, maxBurstSeconds, initializeWarm);
                 }));
+  }
+
+  private double sanitizedPermitsPerSecond(String datasetName, DatasetMetadata datasetMetadata) {
+    double permitsPerSecond = (double) datasetMetadata.getThroughputBytes() / preprocessorCount;
+    if (permitsPerSecond > 0) {
+      return permitsPerSecond;
+    }
+    LOG.warn(
+        "Dataset {} has non-positive throughput {} with preprocessorCount {}. "
+            + "Using a disabled rate limiter until throughput is updated.",
+        datasetName,
+        datasetMetadata.getThroughputBytes(),
+        preprocessorCount);
+    return Double.MIN_VALUE;
   }
 
   private static List<Tag> getMeterTags(String serviceName, MessageDropReason reason) {

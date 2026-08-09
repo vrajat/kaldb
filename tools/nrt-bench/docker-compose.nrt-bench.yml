@@ -1,0 +1,233 @@
+x-healthcheck-common: &healthcheck-common
+  interval: 5s
+  timeout: 5s
+  retries: 30
+
+services:
+  zookeeper:
+    image: zookeeper:3.9
+    ports:
+      - "12181:2181"
+    environment:
+      ZOO_STANDALONE_ENABLED: "true"
+      ZOO_4LW_COMMANDS_WHITELIST: "ruok,stat"
+
+  kafka:
+    image: bitnamilegacy/kafka:3.2.3
+    ports:
+      - "19092:9092"
+      - "29092:29092"
+    environment:
+      - KAFKA_BROKER_ID=1
+      - KAFKA_LISTENERS=INTERNAL://:29092,EXTERNAL://:9092
+      - KAFKA_ADVERTISED_LISTENERS=INTERNAL://kafka:29092,EXTERNAL://127.0.0.1:19092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      - KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL
+      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+    depends_on:
+      - zookeeper
+
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "19090:9000"
+      - "19091:9001"
+    environment:
+      - MINIO_ROOT_USER=${KALDB_S3_ACCESS_KEY:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${KALDB_S3_SECRET_KEY:-minioadmin}
+    command: server /data --console-address ":9001"
+
+  minio_setup:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until mc alias set local http://minio:9000 "${KALDB_S3_ACCESS_KEY:-minioadmin}" "${KALDB_S3_SECRET_KEY:-minioadmin}"; do
+          sleep 1
+        done
+        mc mb --ignore-existing "local/${KALDB_S3_BUCKET:-nrt-bench-bucket}"
+
+  openzipkin:
+    image: openzipkin/zipkin-slim
+    ports:
+      - "19411:9411"
+
+  astra_preprocessor:
+    image: slackhq/astra
+    env_file:
+      - ./configs/nrt-bench.env
+    ports:
+      - "18086:8086"
+    environment:
+      - NODE_ROLES=PREPROCESSOR
+      - ASTRA_PREPROCESSOR_SERVER_ADDRESS=astra_preprocessor
+      - ASTRA_PREPROCESSOR_USE_BULK_API=true
+      - ASTRA_ZK_CONNECTION_STRING=zookeeper:2181
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - S3_ENDPOINT=${KALDB_S3_ENDPOINT:-http://minio:9000}
+      - S3_BUCKET=${KALDB_S3_BUCKET:-nrt-bench-bucket}
+      - S3_REGION=${KALDB_S3_REGION:-us-east-1}
+      - S3_ACCESS_KEY=${KALDB_S3_ACCESS_KEY:-access}
+      - S3_SECRET_KEY=${KALDB_S3_SECRET_KEY:-secret}
+      - ZIPKIN_TRACING_ENDPOINT=http://openzipkin:9411/api/v2/spans
+    depends_on:
+      - zookeeper
+      - kafka
+      - minio
+      - minio_setup
+      - openzipkin
+
+  astra_index:
+    image: slackhq/astra
+    env_file:
+      - ./configs/nrt-bench.env
+    ports:
+      - "18080:8080"
+    environment:
+      - NODE_ROLES=INDEX
+      - ASTRA_INDEX_SERVER_ADDRESS=astra_index
+      - ASTRA_ZK_CONNECTION_STRING=zookeeper:2181
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - S3_ENDPOINT=${KALDB_S3_ENDPOINT:-http://minio:9000}
+      - S3_BUCKET=${KALDB_S3_BUCKET:-nrt-bench-bucket}
+      - S3_REGION=${KALDB_S3_REGION:-us-east-1}
+      - S3_ACCESS_KEY=${KALDB_S3_ACCESS_KEY:-access}
+      - S3_SECRET_KEY=${KALDB_S3_SECRET_KEY:-secret}
+      - ZIPKIN_TRACING_ENDPOINT=http://openzipkin:9411/api/v2/spans
+    depends_on:
+      - astra_preprocessor
+    networks:
+      default:
+        aliases:
+          - astra-index
+
+  astra_index_replacement:
+    image: slackhq/astra
+    env_file:
+      - ./configs/nrt-bench.env
+    ports:
+      - "28080:8080"
+    environment:
+      - NODE_ROLES=INDEX
+      - ASTRA_INDEX_SERVER_ADDRESS=astra_index_replacement
+      - ASTRA_ZK_CONNECTION_STRING=zookeeper:2181
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - S3_ENDPOINT=${KALDB_S3_ENDPOINT:-http://minio:9000}
+      - S3_BUCKET=${KALDB_S3_BUCKET:-nrt-bench-bucket}
+      - S3_REGION=${KALDB_S3_REGION:-us-east-1}
+      - S3_ACCESS_KEY=${KALDB_S3_ACCESS_KEY:-access}
+      - S3_SECRET_KEY=${KALDB_S3_SECRET_KEY:-secret}
+      - ZIPKIN_TRACING_ENDPOINT=http://openzipkin:9411/api/v2/spans
+    depends_on:
+      - astra_preprocessor
+
+  astra_manager:
+    image: slackhq/astra
+    env_file:
+      - ./configs/nrt-bench.env
+    ports:
+      - "18083:8083"
+    environment:
+      - NODE_ROLES=MANAGER
+      - ASTRA_MANAGER_SERVER_ADDRESS=astra_manager
+      - ASTRA_ZK_CONNECTION_STRING=zookeeper:2181
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - S3_ENDPOINT=${KALDB_S3_ENDPOINT:-http://minio:9000}
+      - S3_BUCKET=${KALDB_S3_BUCKET:-nrt-bench-bucket}
+      - S3_REGION=${KALDB_S3_REGION:-us-east-1}
+      - S3_ACCESS_KEY=${KALDB_S3_ACCESS_KEY:-access}
+      - S3_SECRET_KEY=${KALDB_S3_SECRET_KEY:-secret}
+      - ZIPKIN_TRACING_ENDPOINT=http://openzipkin:9411/api/v2/spans
+    depends_on:
+      - astra_preprocessor
+
+  astra_query:
+    image: slackhq/astra
+    env_file:
+      - ./configs/nrt-bench.env
+    ports:
+      - "18081:8081"
+    environment:
+      - NODE_ROLES=QUERY
+      - ASTRA_QUERY_SERVER_ADDRESS=astra_query
+      - ASTRA_MANAGER_CONNECTION_STRING=astra_manager:8083
+      - ASTRA_ZK_CONNECTION_STRING=zookeeper:2181
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - S3_ENDPOINT=${KALDB_S3_ENDPOINT:-http://minio:9000}
+      - S3_BUCKET=${KALDB_S3_BUCKET:-nrt-bench-bucket}
+      - S3_REGION=${KALDB_S3_REGION:-us-east-1}
+      - S3_ACCESS_KEY=${KALDB_S3_ACCESS_KEY:-access}
+      - S3_SECRET_KEY=${KALDB_S3_SECRET_KEY:-secret}
+      - ZIPKIN_TRACING_ENDPOINT=http://openzipkin:9411/api/v2/spans
+    depends_on:
+      - astra_preprocessor
+      - astra_manager
+    networks:
+      default:
+        aliases:
+          - astra-query
+
+  astra_cache_a:
+    image: slackhq/astra
+    env_file:
+      - ./configs/nrt-bench.env
+    ports:
+      - "18082:8082"
+    environment:
+      - NODE_ROLES=CACHE
+      - ASTRA_CACHE_SERVER_ADDRESS=astra_cache_a
+      - ASTRA_ZK_CONNECTION_STRING=zookeeper:2181
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - S3_ENDPOINT=${KALDB_S3_ENDPOINT:-http://minio:9000}
+      - S3_BUCKET=${KALDB_S3_BUCKET:-nrt-bench-bucket}
+      - S3_REGION=${KALDB_S3_REGION:-us-east-1}
+      - S3_ACCESS_KEY=${KALDB_S3_ACCESS_KEY:-access}
+      - S3_SECRET_KEY=${KALDB_S3_SECRET_KEY:-secret}
+      - ZIPKIN_TRACING_ENDPOINT=http://openzipkin:9411/api/v2/spans
+    depends_on:
+      - astra_preprocessor
+
+  astra_cache_b:
+    image: slackhq/astra
+    env_file:
+      - ./configs/nrt-bench.env
+    ports:
+      - "28082:8082"
+    environment:
+      - NODE_ROLES=CACHE
+      - ASTRA_CACHE_SERVER_ADDRESS=astra_cache_b
+      - ASTRA_ZK_CONNECTION_STRING=zookeeper:2181
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - S3_ENDPOINT=${KALDB_S3_ENDPOINT:-http://minio:9000}
+      - S3_BUCKET=${KALDB_S3_BUCKET:-nrt-bench-bucket}
+      - S3_REGION=${KALDB_S3_REGION:-us-east-1}
+      - S3_ACCESS_KEY=${KALDB_S3_ACCESS_KEY:-access}
+      - S3_SECRET_KEY=${KALDB_S3_SECRET_KEY:-secret}
+      - ZIPKIN_TRACING_ENDPOINT=http://openzipkin:9411/api/v2/spans
+    depends_on:
+      - astra_preprocessor
+
+  astra_recovery:
+    image: slackhq/astra
+    env_file:
+      - ./configs/nrt-bench.env
+    ports:
+      - "18085:8085"
+    environment:
+      - NODE_ROLES=RECOVERY
+      - ASTRA_RECOVERY_SERVER_ADDRESS=astra_recovery
+      - ASTRA_ZK_CONNECTION_STRING=zookeeper:2181
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - S3_ENDPOINT=${KALDB_S3_ENDPOINT:-http://minio:9000}
+      - S3_BUCKET=${KALDB_S3_BUCKET:-nrt-bench-bucket}
+      - S3_REGION=${KALDB_S3_REGION:-us-east-1}
+      - S3_ACCESS_KEY=${KALDB_S3_ACCESS_KEY:-access}
+      - S3_SECRET_KEY=${KALDB_S3_SECRET_KEY:-secret}
+      - ZIPKIN_TRACING_ENDPOINT=http://openzipkin:9411/api/v2/spans
+    depends_on:
+      - astra_preprocessor

@@ -153,6 +153,12 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
     return HexFormat.of().formatHex(digest.digest());
   }
 
+  private static boolean hasLiveSnapshotManifest(SnapshotMetadata snapshotMetadata) {
+    return snapshotMetadata.isLive()
+        && snapshotMetadata.snapshotPath != null
+        && !snapshotMetadata.snapshotPath.isBlank();
+  }
+
   public ReadOnlyChunkImpl(
       AsyncCuratorFramework curatorFramework,
       MeterRegistry meterRegistry,
@@ -287,7 +293,7 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
   }
 
   public void downloadChunkData() {
-    if (snapshotMetadata.isLive()) {
+    if (hasLiveSnapshotManifest(snapshotMetadata)) {
       downloadLiveChunkData();
       return;
     }
@@ -311,13 +317,12 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
         dataDirectory =
             Path.of(
                 String.format("%s/astra-chunk-%s", dataDirectoryPrefix, assignment.assignmentId));
+        Files.createDirectories(dataDirectory);
 
-        if (Files.isDirectory(dataDirectory)) {
-          try (Stream<Path> files = Files.list(dataDirectory)) {
-            if (files.findFirst().isPresent()) {
-              LOG.warn("Existing files found in slot directory, clearing directory");
-              cleanDirectory();
-            }
+        try (Stream<Path> files = Files.list(dataDirectory)) {
+          if (files.findFirst().isPresent()) {
+            LOG.warn("Existing files found in slot directory, clearing directory");
+            cleanDirectory();
           }
         }
 
@@ -405,6 +410,9 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
         && updatedSnapshotMetadata.snapshotGeneration > snapshotMetadata.snapshotGeneration) {
       try {
         applyLiveSnapshot(updatedSnapshotMetadata);
+        if (assignment == null) {
+          cacheSlotLastKnownState = Metadata.CacheSlotMetadata.CacheSlotState.LIVE;
+        }
       } catch (Exception e) {
         LOG.warn(
             "Failed to apply live snapshot update snapshot={} generation={}",
@@ -421,16 +429,9 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
       NrtManifest manifest = nrtBlobStore.readManifest(liveSnapshotMetadata.snapshotPath);
       validateManifest(liveSnapshotMetadata, manifest);
 
-      Path stagingDirectory =
-          Path.of(
-              String.format(
-                  "%s/astra-nrt-%s-%020d",
-                  dataDirectoryPrefix,
-                  assignment.assignmentId,
-                  liveSnapshotMetadata.snapshotGeneration));
-      if (Files.isDirectory(stagingDirectory)) {
-        FileUtils.cleanDirectory(stagingDirectory.toFile());
-      }
+      Path stagingDirectory = resolveLiveSnapshotDirectory(liveSnapshotMetadata);
+      Files.createDirectories(stagingDirectory);
+      FileUtils.cleanDirectory(stagingDirectory.toFile());
       blobStore.download(
           String.format(
               "nrt/v1/partitions/%s/chunks/%s/files",
@@ -461,7 +462,9 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
             registerSearchMetadata(searchMetadataStore, searchContext, liveSnapshotMetadata.name);
       }
 
-      if (lastKnownAssignmentState != Metadata.CacheNodeAssignment.CacheNodeAssignmentState.LIVE) {
+      if (assignment != null
+          && lastKnownAssignmentState
+              != Metadata.CacheNodeAssignment.CacheNodeAssignmentState.LIVE) {
         if (!setAssignmentState(
             getCacheNodeAssignment(), Metadata.CacheNodeAssignment.CacheNodeAssignmentState.LIVE)) {
           throw new InterruptedException("Failed to set live chunk assignment state");
@@ -471,6 +474,21 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
     } finally {
       chunkAssignmentLock.unlock();
     }
+  }
+
+  private Path resolveLiveSnapshotDirectory(SnapshotMetadata liveSnapshotMetadata) {
+    if (assignment != null) {
+      return Path.of(
+          String.format(
+              "%s/astra-nrt-%s-%020d",
+              dataDirectoryPrefix,
+              assignment.assignmentId,
+              liveSnapshotMetadata.snapshotGeneration));
+    }
+    if (dataDirectory == null) {
+      throw new IllegalStateException("Live slot assignment requires a slot data directory");
+    }
+    return dataDirectory;
   }
 
   private void registerLiveSnapshotListener() {
@@ -574,17 +592,28 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
       dataDirectory =
           Path.of(
               String.format("%s/astra-slot-%s", dataDirectoryPrefix, cacheSlotMetadata.replicaId));
+      Files.createDirectories(dataDirectory);
 
-      if (Files.isDirectory(dataDirectory)) {
-        try (Stream<Path> files = Files.list(dataDirectory)) {
-          if (files.findFirst().isPresent()) {
-            LOG.warn("Existing files found in slot directory, clearing directory");
-            cleanDirectory();
-          }
+      try (Stream<Path> files = Files.list(dataDirectory)) {
+        if (files.findFirst().isPresent()) {
+          LOG.warn("Existing files found in slot directory, clearing directory");
+          cleanDirectory();
         }
       }
 
       SnapshotMetadata snapshotMetadata = getSnapshotMetadata(cacheSlotMetadata.replicaId);
+      if (hasLiveSnapshotManifest(snapshotMetadata)) {
+        this.snapshotMetadata = snapshotMetadata;
+        registerLiveSnapshotListener();
+        applyLiveSnapshot(snapshotMetadata);
+        if (!setChunkMetadataState(
+            cacheSlotMetadata, Metadata.CacheSlotMetadata.CacheSlotState.LIVE)) {
+          throw new InterruptedException("Failed to set chunk metadata state to loading");
+        }
+        cacheSlotLastKnownState = Metadata.CacheSlotMetadata.CacheSlotState.LIVE;
+        assignmentTimer.stop(chunkAssignmentTimerSuccess);
+        return;
+      }
       blobStore.download(snapshotMetadata.snapshotId, dataDirectory);
       try (Stream<Path> fileList = Files.list(dataDirectory)) {
         long numFilesLocal = fileList.count();
@@ -724,6 +753,7 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
   private void cleanDirectory() {
     if (dataDirectory != null) {
       try {
+        Files.createDirectories(dataDirectory);
         FileUtils.cleanDirectory(dataDirectory.toFile());
       } catch (Exception e) {
         LOG.error("Error removing files {}", dataDirectory.toString(), e);

@@ -2,6 +2,7 @@ package com.slack.astra.blobfs.nrt;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -13,11 +14,13 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.slack.astra.blobfs.BlobStore;
+import com.slack.astra.blobfs.S3AsyncUtil;
 import com.slack.astra.chunk.ReadWriteChunk;
 import com.slack.astra.logstore.LogStore;
 import com.slack.astra.metadata.schema.LuceneFieldDef;
 import com.slack.astra.metadata.snapshot.SnapshotMetadata;
 import com.slack.astra.metadata.snapshot.SnapshotMetadataStore;
+import com.slack.astra.proto.config.AstraConfigs;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -26,6 +29,7 @@ import org.apache.lucene.index.IndexCommit;
 import org.apache.lucene.store.FSDirectory;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 
 class NrtSnapshotPublisherTest {
   private static final String SNAPSHOT_ID = "LIVE_chunk-1";
@@ -121,6 +125,46 @@ class NrtSnapshotPublisherTest {
     verify(context.snapshotMetadataStore).updateSync(updated);
   }
 
+  @Test
+  void testConfiguredS3SmokePublishRoundTrip() throws Exception {
+    AstraConfigs.S3Config s3Config = s3SmokeConfig();
+    String bucket = s3Config.getS3Bucket();
+    assumeTrue(bucket != null && !bucket.isBlank(), "NRT_S3_SMOKE_BUCKET must be set");
+
+    try (var s3Client = S3AsyncUtil.initS3Client(s3Config)) {
+      BlobStore blobStore = new BlobStore(s3Client, bucket, s3Config.getS3PathPrefix());
+      try {
+        TestContext context = realS3TestContext(blobStore);
+        SnapshotMetadata updated =
+            context.publisher.publish(context.logStore, context.snapshotMetadata, 10);
+        NrtBlobStore.NrtManifest manifest = context.nrtBlobStore.readManifest(updated.snapshotPath);
+
+        assertThat(updated.snapshotGeneration).isEqualTo(1);
+        assertThat(updated.snapshotPath)
+            .startsWith(
+                "nrt/v1/partitions/" + PARTITION_ID + "/chunks/" + SNAPSHOT_ID + "/manifests/");
+        assertThat(manifest.snapshotId()).isEqualTo(SNAPSHOT_ID);
+        assertThat(manifest.manifestGeneration()).isEqualTo(1);
+        assertThat(manifest.startOffsetInclusive()).isEqualTo(10);
+        assertThat(manifest.schemaFile().key())
+            .isEqualTo(context.filesPath + "/" + ReadWriteChunk.SCHEMA_FILE_NAME);
+
+        String prefixedManifestKey =
+            s3Config.getS3PathPrefix().isBlank()
+                ? updated.snapshotPath
+                : s3Config.getS3PathPrefix() + "/" + updated.snapshotPath;
+        s3Client
+            .headObject(HeadObjectRequest.builder().bucket(bucket).key(prefixedManifestKey).build())
+            .get();
+      } finally {
+        if (!Boolean.parseBoolean(
+            System.getenv().getOrDefault("NRT_S3_SMOKE_SKIP_CLEANUP", "false"))) {
+          blobStore.delete("nrt");
+        }
+      }
+    }
+  }
+
   private static TestContext testContext(String currentSnapshotPath, long generation)
       throws Exception {
     Path indexDirectory = Files.createTempDirectory("nrt-publisher-test");
@@ -167,6 +211,76 @@ class NrtSnapshotPublisherTest {
         snapshotMetadata,
         snapshotPath,
         filesPath);
+  }
+
+  private static TestContext realS3TestContext(BlobStore blobStore) throws Exception {
+    Path indexDirectory = Files.createTempDirectory("nrt-publisher-s3-smoke");
+    Files.writeString(indexDirectory.resolve("segments_1"), "segment data");
+
+    NrtBlobStore nrtBlobStore = new NrtBlobStore(blobStore);
+    SnapshotMetadataStore snapshotMetadataStore = mock(SnapshotMetadataStore.class);
+    LogStore logStore = mock(LogStore.class);
+    IndexCommit indexCommit = mock(IndexCommit.class);
+    FSDirectory directory = FSDirectory.open(indexDirectory);
+    ConcurrentHashMap<String, LuceneFieldDef> schema = new ConcurrentHashMap<>();
+    schema.put("message", new LuceneFieldDef("message", "keyword", true, true, false));
+
+    when(logStore.getDirectory()).thenReturn(directory);
+    when(logStore.getIndexCommit()).thenReturn(indexCommit);
+    when(logStore.getSchema()).thenReturn(schema);
+    when(indexCommit.getFileNames()).thenReturn(List.of("segments_1"));
+    when(indexCommit.getGeneration()).thenReturn(7L);
+
+    String snapshotPath = NrtBlobStore.manifestPath(PARTITION_ID, SNAPSHOT_ID, 1, "indexer-1");
+    String filesPath = NrtBlobStore.filesPath(PARTITION_ID, SNAPSHOT_ID);
+    SnapshotMetadata snapshotMetadata =
+        new SnapshotMetadata(
+            SNAPSHOT_ID,
+            1000,
+            2000,
+            25,
+            PARTITION_ID,
+            0,
+            SnapshotMetadata.SnapshotType.LIVE,
+            SnapshotMetadata.IndexType.LUCENE,
+            "",
+            0,
+            SnapshotMetadata.DEFAULT_VERSION);
+
+    return new TestContext(
+        blobStore,
+        nrtBlobStore,
+        snapshotMetadataStore,
+        logStore,
+        new NrtSnapshotPublisher(blobStore, nrtBlobStore, snapshotMetadataStore, "indexer-1"),
+        snapshotMetadata,
+        snapshotPath,
+        filesPath);
+  }
+
+  private static AstraConfigs.S3Config s3SmokeConfig() {
+    String bucket = System.getenv("NRT_S3_SMOKE_BUCKET");
+    String region = System.getenv().getOrDefault("NRT_S3_SMOKE_REGION", "us-east-1");
+    String endpoint = System.getenv().getOrDefault("NRT_S3_SMOKE_ENDPOINT", "");
+    String accessKey = System.getenv().getOrDefault("NRT_S3_SMOKE_ACCESS_KEY", "");
+    String secretKey = System.getenv().getOrDefault("NRT_S3_SMOKE_SECRET_KEY", "");
+    String pathPrefix =
+        System.getenv()
+            .getOrDefault("NRT_S3_SMOKE_PREFIX", "nrt-smoke/" + System.currentTimeMillis());
+
+    AstraConfigs.S3Config.Builder builder =
+        AstraConfigs.S3Config.newBuilder()
+            .setS3Bucket(bucket == null ? "" : bucket)
+            .setS3Region(region)
+            .setS3PathPrefix(pathPrefix)
+            .setS3TargetThroughputGbps(10D);
+    if (!endpoint.isBlank()) {
+      builder.setS3EndPoint(endpoint);
+    }
+    if (!accessKey.isBlank() && !secretKey.isBlank()) {
+      builder.setS3AccessKey(accessKey).setS3SecretKey(secretKey);
+    }
+    return builder.build();
   }
 
   private static NrtBlobStore.NrtManifest manifest(String filesPath, long manifestGeneration) {
