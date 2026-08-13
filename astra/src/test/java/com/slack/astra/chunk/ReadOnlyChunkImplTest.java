@@ -859,14 +859,11 @@ public class ReadOnlyChunkImplTest {
         cacheNodeAssignmentStore, assignmentId, snapshotId, cacheNodeId, replicaSet, replicaId);
     initializeCacheNode(cacheNodeMetadataStore, cacheNodeId, "some-host.name", 1, replicaSet, true);
 
-    // Spy the blob store and override download to simulate missing file
+    // Spy the blob store and override download to simulate missing file.
     BlobStore spyBlobStore = org.mockito.Mockito.spy(blobStore);
     doAnswer(
             invocation -> {
-              // Actually call through first to do the full download
               invocation.callRealMethod();
-
-              // Then delete one of the files locally to simulate incomplete download
               Path targetDir = invocation.getArgument(1);
               Path schemaFile = targetDir.resolve(SCHEMA_FILE_NAME);
               java.nio.file.Files.deleteIfExists(schemaFile);
@@ -1218,13 +1215,16 @@ public class ReadOnlyChunkImplTest {
         new CacheNodeMetadataStore(curatorFramework, metadataStoreConfig, meterRegistry);
 
     String replicaId = "live-slot-replica";
-    String snapshotId = "live-slot-snapshot";
+    String snapshotId = "LIVE_live-slot-snapshot";
     String assignmentId = "live-slot-assignment";
     String cacheNodeId = "live-slot-cache-node";
     String replicaSet = "rep1";
 
     initializeZkReplica(curatorFramework, metadataStoreConfig, replicaId, snapshotId);
-    initializeNrtBlobStorageWithIndex(snapshotMetadataStore, snapshotId, 10);
+    SnapshotMetadataStore writerSnapshotMetadataStore =
+        new SnapshotMetadataStore(curatorFramework, metadataStoreConfig, meterRegistry);
+    SnapshotMetadata liveSnapshotMetadata =
+        initializeNrtBlobStorageWithIndex(writerSnapshotMetadataStore, snapshotId, 10);
     initializeCacheNodeAssignment(
         cacheNodeAssignmentStore, assignmentId, snapshotId, cacheNodeId, replicaSet, replicaId);
     initializeCacheNode(cacheNodeMetadataStore, cacheNodeId, "some-host.name", 1, replicaSet, true);
@@ -1244,7 +1244,7 @@ public class ReadOnlyChunkImplTest {
             searchMetadataStore,
             cacheNodeAssignmentStore,
             cacheNodeAssignmentStore.getSync(cacheNodeId, assignmentId),
-            snapshotMetadataStore.findSync(snapshotId),
+            liveSnapshotMetadata,
             cacheNodeMetadataStore);
 
     await()

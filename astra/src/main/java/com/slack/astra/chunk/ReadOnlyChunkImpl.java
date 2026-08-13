@@ -131,6 +131,20 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
     }
   }
 
+  private void downloadManifestFiles(Path stagingDirectory, NrtManifest manifest)
+      throws IOException {
+    downloadManifestFile(stagingDirectory, manifest.schemaFile());
+    for (FileEntry fileEntry : manifest.files()) {
+      downloadManifestFile(stagingDirectory, fileEntry);
+    }
+  }
+
+  private void downloadManifestFile(Path stagingDirectory, FileEntry fileEntry) throws IOException {
+    Path destinationFile = stagingDirectory.resolve(fileEntry.name());
+    Files.createDirectories(destinationFile.getParent());
+    blobStore.downloadFile(fileEntry.key(), destinationFile);
+  }
+
   private static void validateFileEntry(Path stagingDirectory, FileEntry fileEntry)
       throws Exception {
     Path filePath = stagingDirectory.resolve(fileEntry.name());
@@ -432,11 +446,7 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
       Path stagingDirectory = resolveLiveSnapshotDirectory(liveSnapshotMetadata);
       Files.createDirectories(stagingDirectory);
       FileUtils.cleanDirectory(stagingDirectory.toFile());
-      blobStore.download(
-          String.format(
-              "nrt/v1/partitions/%s/chunks/%s/files",
-              manifest.partitionId(), manifest.snapshotId()),
-          stagingDirectory);
+      downloadManifestFiles(stagingDirectory, manifest);
       validateManifestFiles(stagingDirectory, manifest);
 
       ChunkSchema nextChunkSchema =
@@ -573,6 +583,9 @@ public class ReadOnlyChunkImpl<T> implements Chunk<T> {
   private SnapshotMetadata getSnapshotMetadata(String replicaId)
       throws ExecutionException, InterruptedException, TimeoutException {
     ReplicaMetadata replicaMetadata = replicaMetadataStore.findSync(replicaId);
+    if (replicaMetadata.snapshotId.startsWith("LIVE_")) {
+      return snapshotMetadataStore.getSync("LIVE", replicaMetadata.snapshotId);
+    }
     return snapshotMetadataStore.findSync(replicaMetadata.snapshotId);
   }
 

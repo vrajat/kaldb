@@ -93,7 +93,8 @@ public class NrtSnapshotPublisher {
 
     long manifestGeneration = liveSnapshotMetadata.snapshotGeneration + 1;
     String filesPath =
-        NrtBlobStore.filesPath(liveSnapshotMetadata.partitionId, liveSnapshotMetadata.snapshotId);
+        NrtBlobStore.filesPath(
+            liveSnapshotMetadata.partitionId, liveSnapshotMetadata.snapshotId, manifestGeneration);
 
     logStore.commit();
     logStore.refresh();

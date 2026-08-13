@@ -187,7 +187,7 @@ class NrtSnapshotPublisherTest {
 
     String snapshotPath =
         NrtBlobStore.manifestPath(PARTITION_ID, SNAPSHOT_ID, generation + 1, "indexer-1");
-    String filesPath = NrtBlobStore.filesPath(PARTITION_ID, SNAPSHOT_ID);
+    String filesPath = NrtBlobStore.filesPath(PARTITION_ID, SNAPSHOT_ID, generation + 1);
     SnapshotMetadata snapshotMetadata =
         new SnapshotMetadata(
             SNAPSHOT_ID,
@@ -232,7 +232,7 @@ class NrtSnapshotPublisherTest {
     when(indexCommit.getGeneration()).thenReturn(7L);
 
     String snapshotPath = NrtBlobStore.manifestPath(PARTITION_ID, SNAPSHOT_ID, 1, "indexer-1");
-    String filesPath = NrtBlobStore.filesPath(PARTITION_ID, SNAPSHOT_ID);
+    String filesPath = NrtBlobStore.filesPath(PARTITION_ID, SNAPSHOT_ID, 1);
     SnapshotMetadata snapshotMetadata =
         new SnapshotMetadata(
             SNAPSHOT_ID,
