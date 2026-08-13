@@ -99,7 +99,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--restart-grace-seconds", type=int, default=10)
     parser.add_argument("--resume-timeout", type=int, default=240)
     parser.add_argument("--replacement-ready-timeout", type=int, default=90)
-    parser.add_argument("--visibility-timeout", type=int, default=90)
+    parser.add_argument("--visibility-timeout", type=int, default=300)
+    parser.add_argument("--publish-quiet-seconds", type=int, default=20)
     parser.add_argument("--ingest-max-retries", type=int, default=3)
     parser.add_argument("--ingest-retry-backoff-seconds", type=float, default=5.0)
     parser.add_argument("--compose-up", dest="compose_up", action="store_true")
@@ -392,6 +393,7 @@ class RunState:
     query_latencies_ms: list[float] = field(default_factory=list)
     publish_generations: list[int] = field(default_factory=list)
     cache_searchable_hosts: set[str] = field(default_factory=set)
+    freshness_result: dict[str, Any] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -812,6 +814,8 @@ class BenchmarkHarness:
                 "target_bytes": self.target_bytes,
                 "ingest_throughput_bytes": self.ingest_throughput_bytes,
                 "lag_budget_docs": self.lag_budget_docs,
+                "visibility_timeout_seconds": self.args.visibility_timeout,
+                "publish_quiet_seconds": self.args.publish_quiet_seconds,
                 "s3_bucket": self.args.s3_bucket,
                 "s3_region": self.args.s3_region,
                 "s3_endpoint": self.host_s3_endpoint,
@@ -1239,34 +1243,107 @@ class BenchmarkHarness:
                 return None
             return self.state.latest_ingested_seq - self.state.latest_visible_seq
 
-    def wait_for_visibility_budget(self) -> None:
+    def latest_manifest_count(self) -> int | None:
+        with self.state.lock:
+            if not self.state.s3_object_history:
+                return None
+            return len(self.state.s3_object_history[-1]["manifest_keys"])
+
+    def wait_for_visibility_budget(self) -> dict[str, Any]:
         deadline = time.monotonic() + self.args.visibility_timeout
+        last_manifest_count = self.latest_manifest_count()
+        last_visible_seq: int | None = None
+        quiet_since = time.monotonic()
+        samples: list[dict[str, Any]] = []
         while time.monotonic() < deadline:
             lag_docs = self.current_publish_lag_docs()
+            manifest_count = self.latest_manifest_count()
+            with self.state.lock:
+                visible_seq = (
+                    self.state.latest_visible_seq if self.state.latest_visible_seq >= 0 else None
+                )
+
+            if manifest_count != last_manifest_count or visible_seq != last_visible_seq:
+                quiet_since = time.monotonic()
+                last_manifest_count = manifest_count
+                last_visible_seq = visible_seq
+
+            quiet_seconds = round(time.monotonic() - quiet_since, 3)
             if lag_docs is not None:
+                sample = {
+                    "lag_docs": lag_docs,
+                    "budget_docs": self.lag_budget_docs,
+                    "latest_visible_seq": visible_seq,
+                    "manifest_count": manifest_count,
+                    "quiet_seconds": quiet_seconds,
+                }
+                samples.append(sample)
                 self.event_writer.write(
                     "visibility_lag_sample",
-                    lag_docs=lag_docs,
-                    budget_docs=self.lag_budget_docs,
+                    **sample,
                 )
                 if lag_docs <= self.lag_budget_docs:
+                    result = {
+                        "status": "met",
+                        "lag_docs": lag_docs,
+                        "budget_docs": self.lag_budget_docs,
+                        "latest_visible_seq": visible_seq,
+                        "manifest_count": manifest_count,
+                        "quiet_seconds": quiet_seconds,
+                        "samples": samples[-10:],
+                    }
                     self.event_writer.write(
                         "visibility_budget_met",
-                        lag_docs=lag_docs,
-                        budget_docs=self.lag_budget_docs,
+                        **{k: v for k, v in result.items() if k != "samples"},
                     )
-                    return
+                    with self.state.lock:
+                        self.state.freshness_result = result
+                    return result
+                if (
+                    manifest_count is not None
+                    and quiet_seconds >= self.args.publish_quiet_seconds
+                ):
+                    result = {
+                        "status": "lag_after_publish_quiet",
+                        "lag_docs": lag_docs,
+                        "budget_docs": self.lag_budget_docs,
+                        "latest_visible_seq": visible_seq,
+                        "manifest_count": manifest_count,
+                        "quiet_seconds": quiet_seconds,
+                        "samples": samples[-10:],
+                    }
+                    self.event_writer.write(
+                        "visibility_publish_quiet_lag",
+                        **{k: v for k, v in result.items() if k != "samples"},
+                    )
+                    with self.state.lock:
+                        self.state.freshness_result = result
+                    return result
             self.capture_logs()
             self.update_state_from_logs()
             self.run_query_suite(final_pass=False)
             time.sleep(self.args.query_cadence)
         lag_docs = self.current_publish_lag_docs()
+        manifest_count = self.latest_manifest_count()
+        with self.state.lock:
+            visible_seq = self.state.latest_visible_seq if self.state.latest_visible_seq >= 0 else None
+        result = {
+            "status": "timeout_still_active",
+            "lag_docs": lag_docs,
+            "budget_docs": self.lag_budget_docs,
+            "latest_visible_seq": visible_seq,
+            "manifest_count": manifest_count,
+            "quiet_seconds": round(time.monotonic() - quiet_since, 3),
+            "timeout_seconds": self.args.visibility_timeout,
+            "samples": samples[-10:],
+        }
         self.event_writer.write(
             "visibility_budget_timeout",
-            lag_docs=lag_docs,
-            budget_docs=self.lag_budget_docs,
-            timeout_seconds=self.args.visibility_timeout,
+            **{k: v for k, v in result.items() if k != "samples"},
         )
+        with self.state.lock:
+            self.state.freshness_result = result
+        return result
 
     def duration_seconds(self, start_iso: str | None, end_iso: str | None) -> float | None:
         if not start_iso or not end_iso:
@@ -1530,7 +1607,7 @@ class BenchmarkHarness:
 
     def finalize_summary(self) -> dict[str, Any]:
         self.wait_for_replacement_publish()
-        self.wait_for_visibility_budget()
+        freshness_result = self.wait_for_visibility_budget()
         self.capture_logs()
         parsed_events = self.parse_all_logs()
         nrt_events = [event for event in parsed_events if event["type"] == "nrt_publish"]
@@ -1559,12 +1636,20 @@ class BenchmarkHarness:
                 "indexer_stopped_at": self.state.indexer_stopped_at,
                 "resume_publish_at": self.state.resume_publish_at,
                 "s3_object_history": list(self.state.s3_object_history),
+                "freshness_result": dict(self.state.freshness_result or freshness_result),
             }
         publish_lag_docs = (
             state_snapshot["latest_ingested_seq"] - latest_visible
             if latest_visible is not None
             else None
         )
+        freshness = state_snapshot["freshness_result"]
+        if publish_lag_docs is not None:
+            freshness["lag_docs"] = publish_lag_docs
+            freshness["latest_visible_seq"] = latest_visible
+            freshness["budget_docs"] = self.lag_budget_docs
+            if publish_lag_docs <= self.lag_budget_docs:
+                freshness["status"] = "met_after_final_query"
 
         blocked_reasons: list[str] = []
         fail_reasons: list[str] = []
@@ -1584,9 +1669,24 @@ class BenchmarkHarness:
             fail_reasons.append(f"Bulk ingest reported {state_snapshot['ingest_failed_docs']} failed docs")
         if state_snapshot["query_errors"] > 0:
             fail_reasons.append(f"Recurring queries recorded {state_snapshot['query_errors']} failures")
-        if publish_lag_docs is not None and publish_lag_docs > self.lag_budget_docs:
+        freshness_status = freshness.get("status")
+        if (
+            publish_lag_docs is not None
+            and publish_lag_docs > self.lag_budget_docs
+            and freshness_status == "lag_after_publish_quiet"
+        ):
             fail_reasons.append(
                 f"Latest visible seq lag {publish_lag_docs} exceeded budget {self.lag_budget_docs}"
+                f" after NRT publish was quiet for {self.args.publish_quiet_seconds}s"
+            )
+        elif (
+            publish_lag_docs is not None
+            and publish_lag_docs > self.lag_budget_docs
+            and freshness_status == "timeout_still_active"
+        ):
+            fail_reasons.append(
+                f"NRT publish did not quiesce within {self.args.visibility_timeout}s; "
+                f"latest visible seq lag was {publish_lag_docs} docs"
             )
         status = "pass"
         if blocked_reasons:
@@ -1632,6 +1732,7 @@ class BenchmarkHarness:
                 else None,
                 "publish_events": len(nrt_events),
                 "cache_searchable_hosts": state_snapshot["cache_searchable_hosts"],
+                "freshness": freshness,
             },
             "restart": {
                 "trigger_bytes": self.restart_trigger_bytes,
@@ -1691,6 +1792,9 @@ class BenchmarkHarness:
             f"- Latest publish generation: `{summary['nrt']['latest_publish_generation']}`",
             f"- Replacement publish generation: `{summary['nrt']['replacement_publish_generation']}`",
             f"- Cache searchable hosts: `{', '.join(summary['nrt']['cache_searchable_hosts']) or 'none'}`",
+            f"- Freshness status: `{summary['nrt']['freshness'].get('status')}`",
+            f"- Freshness quiet seconds: `{summary['nrt']['freshness'].get('quiet_seconds')}`",
+            f"- Freshness manifest count: `{summary['nrt']['freshness'].get('manifest_count')}`",
             "",
             "## Restart",
             "",

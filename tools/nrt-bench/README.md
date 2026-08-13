@@ -95,6 +95,8 @@ tools/nrt-bench/run.sh \
   --storage-backend minio \
   --seed 42 \
   --query-cadence 5 \
+  --visibility-timeout 300 \
+  --publish-quiet-seconds 20 \
   --restart-fraction 0.55 \
   --artifact-root tools/nrt-bench/artifacts
 ```
@@ -128,7 +130,8 @@ tools/nrt-bench/run.sh --tier 100MB --no-compose-up
 - passes `--s3-bucket` and `--s3-region` through to KalDB
 - if `--s3-access-key` and `--s3-secret-key` are omitted, KalDB uses the AWS SDK default credential chain
 - `--profile` sets `AWS_PROFILE` for both the harness and KalDB containers
-- mounts the host AWS config directory read-only at `/root/.aws` in KalDB containers
+- mounts the host AWS config directory at `/root/.aws` in KalDB containers; this must be writable
+  for AWS SSO profiles because the Java SDK may refresh `~/.aws/sso/cache`
 - uses the same endpoint and bucket for harness-side object listing
 - if you omit `--s3-endpoint`, object listing falls back to the AWS CLI when available
 
@@ -199,3 +202,12 @@ The harness reports one of:
 
 `blocked` is used intentionally when the run cannot show cache-served live
 continuity, rather than silently degrading to an indexer-only benchmark.
+
+Freshness validation waits until the latest visible `seq_id` is within the tier's
+lag budget. If that does not happen, the report distinguishes two cases:
+
+- `timeout_still_active`: NRT manifest publication was still moving when
+  `--visibility-timeout` elapsed, which points at publish or catch-up throughput.
+- `lag_after_publish_quiet`: manifest publication and query visibility were
+  both quiet for `--publish-quiet-seconds`, but query still lagged, which points
+  at cache visibility or routing.
