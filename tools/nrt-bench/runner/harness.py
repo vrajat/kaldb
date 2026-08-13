@@ -98,7 +98,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-compose-up", dest="compose_up", action="store_false")
     parser.add_argument("--teardown", action="store_true")
     parser.set_defaults(compose_up=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.astra_partition_count != 2:
+        parser.error(
+            "--astra-partition-count must be 2 for docker-compose.nrt-bench.yml; "
+            "manager assignment validation requires at least 2 partitions and this compose "
+            "topology starts indexers for Kafka partitions 0 and 1"
+        )
+    return args
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -136,18 +143,40 @@ def run_command(
     *,
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
+    timeout: float | None = None,
     check: bool = True,
     capture_output: bool = True,
 ) -> CommandResult:
     """Runs a subprocess and returns decoded output."""
     started_at = iso_now()
-    completed = subprocess.run(
-        args,
-        cwd=str(cwd) if cwd else None,
-        env=env,
-        text=True,
-        capture_output=capture_output,
-    )
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            text=True,
+            capture_output=capture_output,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        result = CommandResult(
+            args=args,
+            returncode=124,
+            stdout=stdout,
+            stderr=stderr + f"\nTimed out after {timeout} seconds\n",
+            started_at=started_at,
+            finished_at=iso_now(),
+            cwd=str(cwd) if cwd else None,
+        )
+        if check:
+            raise BenchmarkCommandError(result) from exc
+        return result
     result = CommandResult(
         args=args,
         returncode=completed.returncode,
@@ -333,6 +362,7 @@ class RunState:
     query_latencies_ms: list[float] = field(default_factory=list)
     publish_generations: list[int] = field(default_factory=list)
     cache_searchable_hosts: set[str] = field(default_factory=set)
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class EventWriter:
@@ -486,7 +516,8 @@ class S3Collector(threading.Thread):
                 keys = list_s3_objects(self.endpoint, self.bucket, self.prefix, self.env, target)
                 manifest_keys = [key for key in keys if "/manifests/" in key]
                 snapshot = {"ts": iso_now(), "keys": keys, "manifest_keys": manifest_keys}
-                self.state.s3_object_history.append(snapshot)
+                with self.state.lock:
+                    self.state.s3_object_history.append(snapshot)
                 self.event_writer.write(
                     "s3_poll",
                     path=str(target.relative_to(self.s3_dir.parent)),
@@ -503,12 +534,59 @@ class S3Collector(threading.Thread):
             self.stop_event.wait(self.interval_seconds)
 
 
+class QueryCollector(threading.Thread):
+    """Runs recurring query samples without pacing the ingest loop."""
+
+    def __init__(
+        self,
+        harness: BenchmarkHarness,
+        stop_event: threading.Event,
+        ready_event: threading.Event,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.harness = harness
+        self.stop_event = stop_event
+        self.ready_event = ready_event
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            if not self.ready_event.wait(timeout=1.0):
+                continue
+            self.harness.run_query_suite()
+            self.stop_event.wait(self.harness.args.query_cadence)
+
+
+class LogCollector(threading.Thread):
+    """Captures and parses compose logs on a cadence outside ingest."""
+
+    def __init__(
+        self,
+        harness: BenchmarkHarness,
+        stop_event: threading.Event,
+        interval_seconds: int = 10,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.harness = harness
+        self.stop_event = stop_event
+        self.interval_seconds = interval_seconds
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                self.harness.capture_logs()
+                self.harness.update_state_from_logs()
+            except Exception as exc:
+                self.harness.event_writer.write("log_capture_error", error=str(exc))
+            self.stop_event.wait(self.interval_seconds)
+
+
 class BenchmarkHarness:
     """Owns one end-to-end benchmark run."""
 
     SERVICES = {
         "preprocessor": "http://127.0.0.1:18086/metrics",
         "index": "http://127.0.0.1:18080/metrics",
+        "index_p1": "http://127.0.0.1:38080/metrics",
         "manager": "http://127.0.0.1:18083/metrics",
         "query": "http://127.0.0.1:18081/metrics",
         "cache_a": "http://127.0.0.1:18082/metrics",
@@ -545,6 +623,8 @@ class BenchmarkHarness:
         self.s3_dir = self.artifact_dir / "s3"
         self.command_dir = self.artifact_dir / "commands"
         self.stop_event = threading.Event()
+        self.nrt_ready_event = threading.Event()
+        self.command_lock = threading.Lock()
         self.event_writer = EventWriter(self.artifact_dir / "events.ndjson")
         self.state = RunState(dataset=args.dataset, run_id=self.run_id, artifact_dir=self.artifact_dir)
         self.current_phase = "init"
@@ -554,6 +634,7 @@ class BenchmarkHarness:
         self.logger.propagate = False
         self.random = random.Random(args.seed)
         self.target_bytes = int(self.tier_config["target_bytes"])
+        self.ingest_throughput_bytes = int(self.tier_config["throughput_bytes"])
         self.restart_trigger_bytes = int(self.target_bytes * args.restart_fraction)
         self.target_window_minutes = int(self.tier_config["query_window_minutes"])
         self.lag_budget_docs = int(self.tier_config["lag_budget_docs"])
@@ -626,25 +707,35 @@ class BenchmarkHarness:
         *,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
+        timeout: float | None = None,
         check: bool = True,
         label: str | None = None,
     ) -> CommandResult:
-        self.log(logging.INFO, "Running command: %s", " ".join(args))
-        result = run_command(args, cwd=cwd, env=env, check=False)
-        result.label = label
-        self.persist_command_result(result)
-        self.log(logging.INFO, "Command finished rc=%s: %s", result.returncode, " ".join(args))
-        if check and result.returncode != 0:
-            self.log(logging.ERROR, "Command failed rc=%s: %s", result.returncode, " ".join(args))
-            raise BenchmarkCommandError(result)
-        return result
+        with self.command_lock:
+            self.log(logging.INFO, "Running command: %s", " ".join(args))
+            result = run_command(args, cwd=cwd, env=env, timeout=timeout, check=False)
+            result.label = label
+            self.persist_command_result(result)
+            self.log(logging.INFO, "Command finished rc=%s: %s", result.returncode, " ".join(args))
+            if check and result.returncode != 0:
+                self.log(logging.ERROR, "Command failed rc=%s: %s", result.returncode, " ".join(args))
+                raise BenchmarkCommandError(result)
+            return result
 
     def compose(self, *extra: str) -> CommandResult:
         label = f"docker-compose-{'-'.join(extra[:2])}" if extra else "docker-compose"
+        timeout = 60.0
+        if extra[:1] == ("logs",):
+            timeout = 30.0
+        elif extra[:1] == ("down",):
+            timeout = 180.0
+        elif extra[:1] == ("exec",):
+            timeout = 20.0
         return self.exec_command(
             ["docker", "compose", "-p", self.compose_project, "-f", str(self.compose_file), *extra],
             cwd=self.compose_file.parent,
             env=self.compose_env,
+            timeout=timeout,
             label=label,
         )
 
@@ -677,6 +768,7 @@ class BenchmarkHarness:
                 "restart_fraction": self.args.restart_fraction,
                 "restart_trigger_bytes": self.restart_trigger_bytes,
                 "target_bytes": self.target_bytes,
+                "ingest_throughput_bytes": self.ingest_throughput_bytes,
                 "lag_budget_docs": self.lag_budget_docs,
                 "s3_bucket": self.args.s3_bucket,
                 "s3_region": self.args.s3_region,
@@ -801,32 +893,19 @@ class BenchmarkHarness:
     def desired_partition_ids(self) -> list[str]:
         return [str(partition_id) for partition_id in range(self.args.astra_partition_count)]
 
-    def configure_cluster(self) -> None:
-        self.set_phase("preflight")
-        if self.args.compose_up:
-            self.compose("down", "-v", "--remove-orphans")
-            base_services = ["zookeeper", "kafka", "openzipkin"]
-            if self.args.storage_backend == "minio":
-                base_services.extend(["minio", "minio_setup"])
-            self.compose("up", "-d", *base_services)
-            self.compose(
-                "up",
-                "-d",
-                "astra_preprocessor",
-                "astra_index",
-                "astra_manager",
-                "astra_query",
-                "astra_cache_a",
-                "astra_cache_b",
-                "astra_recovery",
-            )
+    def start_compose_services(self, *services: str) -> None:
+        if not services:
+            return
+        self.log(logging.INFO, "Starting compose services: %s", ", ".join(services))
+        self.compose("up", "-d", *services)
+        self.event_writer.write("compose_services_started", services=list(services))
 
-        wait_for_http("http://127.0.0.1:18083/health", self.args.service_check_timeout)
-        wait_for_http("http://127.0.0.1:18086/health", self.args.service_check_timeout)
-        wait_for_http("http://127.0.0.1:18081/health", self.args.service_check_timeout)
-        self.log(logging.INFO, "Service health checks passed")
-        self.event_writer.write("health_ready", services=["manager", "preprocessor", "query"])
+    def wait_for_compose_http_service(self, service: str, url: str) -> None:
+        self.log(logging.INFO, "Waiting for %s readiness at %s", service, url)
+        wait_for_http(url, self.args.service_check_timeout)
+        self.event_writer.write("compose_service_ready", service=service, url=url)
 
+    def wait_for_kafka_topic_ready(self) -> None:
         self.log(logging.INFO, "Waiting for Kafka admin readiness before topic creation")
         wait_until(
             self.args.kafka_ready_timeout,
@@ -839,12 +918,45 @@ class BenchmarkHarness:
                 "--create",
                 "--topic",
                 "nrt-bench-topic",
+                "--partitions",
+                str(self.args.astra_partition_count),
                 "--if-not-exists",
                 "--bootstrap-server",
                 "kafka:29092",
             ),
         )
-        self.event_writer.write("kafka_topic_ready", topic="nrt-bench-topic")
+        self.event_writer.write(
+            "kafka_topic_ready",
+            topic="nrt-bench-topic",
+            partitions=self.args.astra_partition_count,
+        )
+
+    def configure_cluster(self) -> None:
+        self.set_phase("preflight")
+        if self.args.compose_up:
+            self.compose("down", "-v", "--remove-orphans", "--timeout", "20")
+            self.start_compose_services("zookeeper")
+            self.start_compose_services("kafka")
+            self.wait_for_kafka_topic_ready()
+            self.start_compose_services("openzipkin")
+            if self.args.storage_backend == "minio":
+                self.start_compose_services("minio")
+                self.start_compose_services("minio_setup")
+            self.start_compose_services("astra_preprocessor")
+            self.wait_for_compose_http_service("preprocessor", "http://127.0.0.1:18086/health")
+            self.start_compose_services("astra_manager")
+            self.wait_for_compose_http_service("manager", "http://127.0.0.1:18083/health")
+            self.start_compose_services("astra_index", "astra_index_p1")
+            self.start_compose_services("astra_recovery")
+            self.start_compose_services("astra_cache_a")
+            self.start_compose_services("astra_cache_b")
+            self.start_compose_services("astra_query")
+
+        self.wait_for_compose_http_service("manager", "http://127.0.0.1:18083/health")
+        self.wait_for_compose_http_service("preprocessor", "http://127.0.0.1:18086/health")
+        self.wait_for_compose_http_service("query", "http://127.0.0.1:18081/health")
+        self.log(logging.INFO, "Service health checks passed")
+        self.event_writer.write("health_ready", services=["manager", "preprocessor", "query"])
 
         partition_capacity = max(int(self.tier_config["throughput_bytes"]) * 2, 1)
         partition_ids = self.desired_partition_ids()
@@ -901,6 +1013,8 @@ class BenchmarkHarness:
     def start_collectors(self) -> list[threading.Thread]:
         collectors: list[threading.Thread] = [
             MetricsCollector(self.metrics_dir, self.SERVICES, self.stop_event, self.event_writer),
+            QueryCollector(self, self.stop_event, self.nrt_ready_event),
+            LogCollector(self, self.stop_event),
             DockerStatsCollector(
                 self.stats_dir,
                 self.stop_event,
@@ -928,6 +1042,10 @@ class BenchmarkHarness:
         while time.monotonic() < deadline:
             self.capture_logs()
             events = self.parse_all_logs()
+            self.update_state_from_parsed_events(events)
+            with self.state.lock:
+                if self.state.first_publish_generation is not None:
+                    return
             upload_errors = [event for event in events if event.get("type") == "s3_upload_error"]
             if upload_errors:
                 first_error = upload_errors[0]
@@ -935,17 +1053,6 @@ class BenchmarkHarness:
                     "Indexer hit S3 upload errors before first NRT publish; "
                     f"service={first_error.get('service')} line={first_error.get('line')}"
                 )
-            first_publish = find_latest_publish(events)
-            if first_publish:
-                self.state.first_publish_generation = int(first_publish["generation"])
-                self.state.first_publish_path = str(first_publish["path"])
-                self.state.publish_generations.append(int(first_publish["generation"]))
-                self.event_writer.write(
-                    "first_publish_observed",
-                    generation=first_publish["generation"],
-                    path=first_publish["path"],
-                )
-                return
             time.sleep(5)
         raise RuntimeError("Timed out waiting for first NRT manifest publication")
 
@@ -965,11 +1072,13 @@ class BenchmarkHarness:
         return context
 
     def run_query_suite(self, *, final_pass: bool = False) -> None:
+        with self.state.lock:
+            latest_ingested_seq = self.state.latest_ingested_seq
         for query in self.query_suite:
-            context = self.build_query_context(self.state.latest_ingested_seq)
+            context = self.build_query_context(latest_ingested_seq)
             body = render_template(copy.deepcopy(query["body"]), context)
             if query["name"] == "exact_doc_lookup":
-                body["query"]["bool"]["filter"][1]["term"]["seq_id"] = self.state.latest_ingested_seq
+                body["query"]["bool"]["filter"][1]["term"]["seq_id"] = latest_ingested_seq
             endpoint = render_template(query["endpoint"], context)
             body_json = json.dumps(body)
             start = time.monotonic()
@@ -981,16 +1090,17 @@ class BenchmarkHarness:
                 timeout=20,
             )
             latency_ms = round((time.monotonic() - start) * 1000.0, 2)
-            self.state.query_latencies_ms.append(latency_ms)
             if 200 <= status < 300:
-                self.state.query_successes += 1
                 payload = json.loads(response_text)
                 hit_count = extract_hit_count(payload)
                 latest_visible_seq = (
                     extract_latest_seq(payload) if query["name"] == "latest_visible_seq" else None
                 )
-                if latest_visible_seq is not None:
-                    self.state.latest_visible_seq = latest_visible_seq
+                with self.state.lock:
+                    self.state.query_latencies_ms.append(latency_ms)
+                    self.state.query_successes += 1
+                    if latest_visible_seq is not None:
+                        self.state.latest_visible_seq = latest_visible_seq
                 exact_lookup_hit = hit_count > 0 if query["name"] == "exact_doc_lookup" else None
                 self.event_writer.write(
                     "query_result",
@@ -1003,7 +1113,9 @@ class BenchmarkHarness:
                     exact_lookup_hit=exact_lookup_hit,
                 )
             else:
-                self.state.query_errors += 1
+                with self.state.lock:
+                    self.state.query_latencies_ms.append(latency_ms)
+                    self.state.query_errors += 1
                 self.event_writer.write(
                     "query_error",
                     name=query["name"],
@@ -1014,35 +1126,42 @@ class BenchmarkHarness:
                 )
 
     def maybe_restart_indexer(self) -> None:
-        if self.state.restart_requested:
-            return
-        if self.state.ingest_bytes_sent < self.restart_trigger_bytes:
-            return
-        if self.state.first_publish_generation is None:
-            return
-
-        self.state.restart_requested = True
-        self.state.indexer_stopped_at = iso_now()
+        with self.state.lock:
+            if self.state.restart_requested:
+                return
+            if self.state.ingest_bytes_sent < self.restart_trigger_bytes:
+                return
+            if self.state.first_publish_generation is None:
+                return
+            self.state.restart_requested = True
+            self.state.indexer_stopped_at = iso_now()
+            indexer_stopped_at = self.state.indexer_stopped_at
         self.set_phase("failover")
         self.compose("stop", "astra_index")
-        self.event_writer.write("indexer_stopped", at=self.state.indexer_stopped_at)
+        self.event_writer.write("indexer_stopped", at=indexer_stopped_at)
         time.sleep(self.args.restart_grace_seconds)
-        self.state.replacement_started_at = iso_now()
+        with self.state.lock:
+            self.state.replacement_started_at = iso_now()
+            replacement_started_at = self.state.replacement_started_at
         self.compose("up", "-d", "astra_index_replacement")
-        self.event_writer.write("replacement_started", at=self.state.replacement_started_at)
+        self.event_writer.write("replacement_started", at=replacement_started_at)
 
     def wait_for_replacement_publish(self) -> None:
-        if not self.state.replacement_started_at:
+        with self.state.lock:
+            replacement_started_at = self.state.replacement_started_at
+            baseline = self.state.first_publish_generation or 0
+        if not replacement_started_at:
             return
         deadline = time.monotonic() + self.args.resume_timeout
-        baseline = self.state.first_publish_generation or 0
         while time.monotonic() < deadline:
             self.capture_logs()
             events = self.parse_all_logs()
+            self.update_state_from_parsed_events(events)
             replacement_publish = find_latest_publish(events, service="astra_index_replacement")
             if replacement_publish and int(replacement_publish["generation"]) > baseline:
-                self.state.resume_publish_at = iso_now()
-                self.state.publish_generations.append(int(replacement_publish["generation"]))
+                with self.state.lock:
+                    self.state.resume_publish_at = iso_now()
+                    self.state.publish_generations.append(int(replacement_publish["generation"]))
                 self.event_writer.write(
                     "replacement_publish_observed",
                     generation=replacement_publish["generation"],
@@ -1065,16 +1184,55 @@ class BenchmarkHarness:
         tail = lines[-limit:]
         return [json.loads(line) for line in tail if line.strip()]
 
-    def should_retry_ingest_error(self, status: int | None, error: Exception | None) -> bool:
+    def is_rate_limit_response(self, status: int | None, response_text: str) -> bool:
+        if status not in {400, 429}:
+            return False
+        return "rate limit exceeded" in response_text.lower()
+
+    def should_retry_ingest_error(
+        self, status: int | None, error: Exception | None, response_text: str = ""
+    ) -> bool:
+        if self.is_rate_limit_response(status, response_text):
+            return True
         if status in {429, 500, 502, 503, 504}:
             return True
         return isinstance(error, (TimeoutError, urllib.error.URLError, socket.timeout))
+
+    def pace_ingest(self, run_started_monotonic: float, next_total_bytes: int) -> None:
+        if self.ingest_throughput_bytes <= 0:
+            return
+        target_rate = self.ingest_throughput_bytes * 0.95
+        target_elapsed = next_total_bytes / target_rate
+        actual_elapsed = time.monotonic() - run_started_monotonic
+        sleep_seconds = target_elapsed - actual_elapsed
+        if sleep_seconds <= 0:
+            return
+        self.event_writer.write(
+            "ingest_paced",
+            sleep_seconds=round(sleep_seconds, 3),
+            target_rate_bytes_per_sec=round(target_rate, 3),
+            next_total_bytes=next_total_bytes,
+        )
+        time.sleep(sleep_seconds)
+
+    def ingest_retry_sleep_seconds(
+        self,
+        *,
+        status: int | None,
+        response_text: str,
+        payload_bytes: int,
+        attempt: int,
+    ) -> float:
+        if self.is_rate_limit_response(status, response_text) and self.ingest_throughput_bytes > 0:
+            return max(payload_bytes / (self.ingest_throughput_bytes * 0.95), 0.1)
+        return self.args.ingest_retry_backoff_seconds * attempt
 
     def post_bulk_batch(self, payload: str, batch_size: int) -> tuple[int, str]:
         attempts = max(1, self.args.ingest_max_retries)
         last_error: Exception | None = None
         last_status: int | None = None
         last_response_text = ""
+        payload_bytes = len(payload.encode("utf-8"))
         for attempt in range(1, attempts + 1):
             error: Exception | None = None
             try:
@@ -1094,7 +1252,7 @@ class BenchmarkHarness:
                 error is not None
                 or status is None
                 or not 200 <= status < 300
-                and self.should_retry_ingest_error(status, error)
+                and self.should_retry_ingest_error(status, error, response_text)
             )
             if error is None and status is not None and 200 <= status < 300:
                 return status, response_text
@@ -1102,7 +1260,8 @@ class BenchmarkHarness:
             last_error = error
             last_status = status
             last_response_text = response_text
-            self.state.ingest_retry_count += 1
+            with self.state.lock:
+                self.state.ingest_retry_count += 1
             self.event_writer.write(
                 "ingest_retry",
                 attempt=attempt,
@@ -1116,9 +1275,21 @@ class BenchmarkHarness:
             self.capture_logs()
             if not retryable or attempt == attempts:
                 break
-            time.sleep(self.args.ingest_retry_backoff_seconds * attempt)
+            retry_sleep_seconds = self.ingest_retry_sleep_seconds(
+                status=status,
+                response_text=response_text,
+                payload_bytes=payload_bytes,
+                attempt=attempt,
+            )
+            self.event_writer.write(
+                "ingest_retry_sleep",
+                attempt=attempt,
+                sleep_seconds=round(retry_sleep_seconds, 3),
+            )
+            time.sleep(retry_sleep_seconds)
 
-        self.state.ingest_failed_docs += batch_size
+        with self.state.lock:
+            self.state.ingest_failed_docs += batch_size
         self.event_writer.write(
             "ingest_error",
             status=last_status,
@@ -1137,17 +1308,25 @@ class BenchmarkHarness:
     def ingest_until_target(self) -> None:
         self.set_phase("warm_ingest")
         next_seq = 0
-        first_publish_waiting = True
-        while self.state.ingest_bytes_sent < self.target_bytes:
+        run_started_monotonic = time.monotonic()
+        while True:
+            with self.state.lock:
+                if self.state.ingest_bytes_sent >= self.target_bytes:
+                    break
             payload, batch_size, latest_seq = self.create_bulk_payload(next_seq)
+            payload_bytes = len(payload.encode("utf-8"))
+            with self.state.lock:
+                next_total_bytes = self.state.ingest_bytes_sent + payload_bytes
+            self.pace_ingest(run_started_monotonic, next_total_bytes)
             status, response_text = self.post_bulk_batch(payload, batch_size)
 
             bulk_result = parse_ndjson_bulk_response(response_text)
-            payload_bytes = len(payload.encode("utf-8"))
-            self.state.ingest_bytes_sent += payload_bytes
-            self.state.ingest_docs_sent += int(bulk_result["total_docs"])
-            self.state.ingest_failed_docs += int(bulk_result["failed_docs"])
-            self.state.latest_ingested_seq = latest_seq
+            with self.state.lock:
+                self.state.ingest_bytes_sent += payload_bytes
+                self.state.ingest_docs_sent += int(bulk_result["total_docs"])
+                self.state.ingest_failed_docs += int(bulk_result["failed_docs"])
+                self.state.latest_ingested_seq = latest_seq
+                total_bytes_sent = self.state.ingest_bytes_sent
             self.event_writer.write(
                 "ingest_batch",
                 status=status,
@@ -1155,29 +1334,24 @@ class BenchmarkHarness:
                 docs=bulk_result["total_docs"],
                 failed_docs=bulk_result["failed_docs"],
                 latest_seq=latest_seq,
-                total_bytes_sent=self.state.ingest_bytes_sent,
+                total_bytes_sent=total_bytes_sent,
             )
-
-            if first_publish_waiting:
-                self.wait_for_first_publish()
-                first_publish_waiting = False
-                self.set_phase("steady_state_nrt")
-
-            self.run_query_suite()
-            self.capture_logs()
-            parsed_events = self.parse_all_logs()
-            for event in parsed_events:
-                if event["type"] == "cache_searchable":
-                    self.state.cache_searchable_hosts.add(str(event["host"]))
 
             self.maybe_restart_indexer()
             next_seq = latest_seq + 1
-            time.sleep(self.args.query_cadence)
+        with self.state.lock:
+            first_publish_seen = self.state.first_publish_generation is not None
+            restart_requested = self.state.restart_requested
+        if not first_publish_seen:
+            self.wait_for_first_publish()
+        if not restart_requested:
+            self.maybe_restart_indexer()
 
     def capture_logs(self) -> None:
         services = [
             "astra_preprocessor",
             "astra_index",
+            "astra_index_p1",
             "astra_index_replacement",
             "astra_manager",
             "astra_query",
@@ -1203,6 +1377,30 @@ class BenchmarkHarness:
             parsed.extend(parse_service_log(log_path.stem, log_path))
         return parsed
 
+    def update_state_from_logs(self) -> None:
+        self.update_state_from_parsed_events(self.parse_all_logs())
+
+    def update_state_from_parsed_events(self, events: list[dict[str, Any]]) -> None:
+        cache_hosts = [str(event["host"]) for event in events if event["type"] == "cache_searchable"]
+        first_publish = find_latest_publish(events)
+        should_emit_first_publish = False
+        with self.state.lock:
+            if cache_hosts:
+                self.state.cache_searchable_hosts.update(cache_hosts)
+            if first_publish and self.state.first_publish_generation is None:
+                self.state.first_publish_generation = int(first_publish["generation"])
+                self.state.first_publish_path = str(first_publish["path"])
+                self.state.publish_generations.append(int(first_publish["generation"]))
+                should_emit_first_publish = True
+        if should_emit_first_publish and first_publish:
+            self.event_writer.write(
+                "first_publish_observed",
+                generation=first_publish["generation"],
+                path=first_publish["path"],
+            )
+            self.nrt_ready_event.set()
+            self.set_phase("steady_state_nrt")
+
     def finalize_summary(self) -> dict[str, Any]:
         self.wait_for_replacement_publish()
         self.capture_logs()
@@ -1210,14 +1408,32 @@ class BenchmarkHarness:
         nrt_events = [event for event in parsed_events if event["type"] == "nrt_publish"]
         cache_events = [event for event in parsed_events if event["type"] == "cache_searchable"]
         s3_upload_errors = [event for event in parsed_events if event["type"] == "s3_upload_error"]
-        self.state.cache_searchable_hosts.update(str(event["host"]) for event in cache_events)
+        self.update_state_from_parsed_events(parsed_events)
         latest_publish = find_latest_publish(parsed_events)
         replacement_publish = find_latest_publish(parsed_events, service="astra_index_replacement")
         self.run_query_suite(final_pass=True)
 
-        latest_visible = self.state.latest_visible_seq if self.state.latest_visible_seq >= 0 else None
+        with self.state.lock:
+            latest_visible = self.state.latest_visible_seq if self.state.latest_visible_seq >= 0 else None
+            state_snapshot = {
+                "ingest_bytes_sent": self.state.ingest_bytes_sent,
+                "ingest_docs_sent": self.state.ingest_docs_sent,
+                "ingest_failed_docs": self.state.ingest_failed_docs,
+                "ingest_retry_count": self.state.ingest_retry_count,
+                "latest_ingested_seq": self.state.latest_ingested_seq,
+                "query_successes": self.state.query_successes,
+                "query_errors": self.state.query_errors,
+                "query_latencies_ms": list(self.state.query_latencies_ms),
+                "first_publish_generation": self.state.first_publish_generation,
+                "first_publish_path": self.state.first_publish_path,
+                "cache_searchable_hosts": sorted(self.state.cache_searchable_hosts),
+                "replacement_started_at": self.state.replacement_started_at,
+                "indexer_stopped_at": self.state.indexer_stopped_at,
+                "resume_publish_at": self.state.resume_publish_at,
+                "s3_object_history": list(self.state.s3_object_history),
+            }
         publish_lag_docs = (
-            self.state.latest_ingested_seq - latest_visible
+            state_snapshot["latest_ingested_seq"] - latest_visible
             if latest_visible is not None
             else None
         )
@@ -1233,19 +1449,21 @@ class BenchmarkHarness:
             )
         if not cache_events:
             blocked_reasons.append("No cache searchability transition was observed in manager logs")
-        if self.state.replacement_started_at and replacement_publish is None:
+        if state_snapshot["replacement_started_at"] and replacement_publish is None:
             blocked_reasons.append("Replacement indexer never published a new NRT generation")
 
-        if self.state.ingest_failed_docs > 0:
-            fail_reasons.append(f"Bulk ingest reported {self.state.ingest_failed_docs} failed docs")
-        if self.state.query_errors > 0:
-            fail_reasons.append(f"Recurring queries recorded {self.state.query_errors} failures")
+        if state_snapshot["ingest_failed_docs"] > 0:
+            fail_reasons.append(f"Bulk ingest reported {state_snapshot['ingest_failed_docs']} failed docs")
+        if state_snapshot["query_errors"] > 0:
+            fail_reasons.append(f"Recurring queries recorded {state_snapshot['query_errors']} failures")
         if publish_lag_docs is not None and publish_lag_docs > self.lag_budget_docs:
             fail_reasons.append(
                 f"Latest visible seq lag {publish_lag_docs} exceeded budget {self.lag_budget_docs}"
             )
-        if self.state.replacement_started_at and replacement_publish is not None and latest_publish is not None:
-            if int(replacement_publish["generation"]) <= int(self.state.first_publish_generation or 0):
+        if state_snapshot["replacement_started_at"] and replacement_publish is not None and latest_publish is not None:
+            if int(replacement_publish["generation"]) <= int(
+                state_snapshot["first_publish_generation"] or 0
+            ):
                 fail_reasons.append("Replacement indexer did not advance snapshot generation")
 
         status = "pass"
@@ -1263,52 +1481,54 @@ class BenchmarkHarness:
             "finished_at": iso_now(),
             "target_bytes": self.target_bytes,
             "ingest": {
-                "bytes_sent": self.state.ingest_bytes_sent,
-                "docs_sent": self.state.ingest_docs_sent,
-                "failed_docs": self.state.ingest_failed_docs,
-                "retry_count": self.state.ingest_retry_count,
-                "latest_ingested_seq": self.state.latest_ingested_seq,
+                "bytes_sent": state_snapshot["ingest_bytes_sent"],
+                "docs_sent": state_snapshot["ingest_docs_sent"],
+                "failed_docs": state_snapshot["ingest_failed_docs"],
+                "retry_count": state_snapshot["ingest_retry_count"],
+                "latest_ingested_seq": state_snapshot["latest_ingested_seq"],
             },
             "queries": {
-                "successes": self.state.query_successes,
-                "errors": self.state.query_errors,
+                "successes": state_snapshot["query_successes"],
+                "errors": state_snapshot["query_errors"],
                 "latest_visible_seq": latest_visible,
                 "publish_lag_docs": publish_lag_docs,
                 "latency_ms": {
-                    "count": len(self.state.query_latencies_ms),
-                    "p50": percentile(self.state.query_latencies_ms, 0.50),
-                    "p95": percentile(self.state.query_latencies_ms, 0.95),
-                    "max": max(self.state.query_latencies_ms) if self.state.query_latencies_ms else None,
+                    "count": len(state_snapshot["query_latencies_ms"]),
+                    "p50": percentile(state_snapshot["query_latencies_ms"], 0.50),
+                    "p95": percentile(state_snapshot["query_latencies_ms"], 0.95),
+                    "max": max(state_snapshot["query_latencies_ms"])
+                    if state_snapshot["query_latencies_ms"]
+                    else None,
                 },
             },
             "nrt": {
-                "first_publish_generation": self.state.first_publish_generation,
-                "first_publish_path": self.state.first_publish_path,
+                "first_publish_generation": state_snapshot["first_publish_generation"],
+                "first_publish_path": state_snapshot["first_publish_path"],
                 "latest_publish_generation": int(latest_publish["generation"]) if latest_publish else None,
                 "replacement_publish_generation": int(replacement_publish["generation"])
                 if replacement_publish
                 else None,
                 "publish_events": len(nrt_events),
-                "cache_searchable_hosts": sorted(self.state.cache_searchable_hosts),
+                "cache_searchable_hosts": state_snapshot["cache_searchable_hosts"],
             },
             "restart": {
                 "trigger_bytes": self.restart_trigger_bytes,
-                "indexer_stopped_at": self.state.indexer_stopped_at,
-                "replacement_started_at": self.state.replacement_started_at,
-                "resume_publish_at": self.state.resume_publish_at,
+                "indexer_stopped_at": state_snapshot["indexer_stopped_at"],
+                "replacement_started_at": state_snapshot["replacement_started_at"],
+                "resume_publish_at": state_snapshot["resume_publish_at"],
                 "resume_lag_seconds": self.duration_seconds(
-                    self.state.replacement_started_at, self.state.resume_publish_at
+                    state_snapshot["replacement_started_at"], state_snapshot["resume_publish_at"]
                 ),
                 "cache_continuity_gap_seconds": self.duration_seconds(
-                    self.state.indexer_stopped_at, self.state.resume_publish_at
+                    state_snapshot["indexer_stopped_at"], state_snapshot["resume_publish_at"]
                 ),
             },
             "s3": {
                 "bucket": self.args.s3_bucket,
                 "prefix": self.s3_prefix,
-                "polls": len(self.state.s3_object_history),
-                "latest_manifest_count": len(self.state.s3_object_history[-1]["manifest_keys"])
-                if self.state.s3_object_history
+                "polls": len(state_snapshot["s3_object_history"]),
+                "latest_manifest_count": len(state_snapshot["s3_object_history"][-1]["manifest_keys"])
+                if state_snapshot["s3_object_history"]
                 else 0,
             },
             "blocked_reasons": blocked_reasons,

@@ -88,6 +88,12 @@ tools/nrt-bench/run.sh \
   --artifact-root tools/nrt-bench/artifacts
 ```
 
+The Docker Compose benchmark topology runs two active indexers, one for Kafka
+partition `0` and one for Kafka partition `1`, plus a replacement indexer for
+partition `0`. Keep `--astra-partition-count` at its default of `2` for this
+compose file; manager assignment validation requires at least two partitions
+and every Kafka partition needs a matching indexer consumer.
+
 To reuse an already-running benchmark cluster instead of recreating it:
 
 ```bash

@@ -2,7 +2,7 @@
   "tiers": {
     "100MB": {
       "target_bytes": 104857600,
-      "batch_size": 200,
+      "batch_size": 5000,
       "throughput_bytes": 8000000,
       "query_window_minutes": 15,
       "lag_budget_docs": 400
