@@ -98,6 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--restart-grace-seconds", type=int, default=10)
     parser.add_argument("--resume-timeout", type=int, default=240)
     parser.add_argument("--replacement-ready-timeout", type=int, default=90)
+    parser.add_argument("--visibility-timeout", type=int, default=90)
     parser.add_argument("--ingest-max-retries", type=int, default=3)
     parser.add_argument("--ingest-retry-backoff-seconds", type=float, default=5.0)
     parser.add_argument("--compose-up", dest="compose_up", action="store_true")
@@ -1220,6 +1221,41 @@ class BenchmarkHarness:
                 return
             time.sleep(5)
 
+    def current_publish_lag_docs(self) -> int | None:
+        with self.state.lock:
+            if self.state.latest_ingested_seq < 0 or self.state.latest_visible_seq < 0:
+                return None
+            return self.state.latest_ingested_seq - self.state.latest_visible_seq
+
+    def wait_for_visibility_budget(self) -> None:
+        deadline = time.monotonic() + self.args.visibility_timeout
+        while time.monotonic() < deadline:
+            lag_docs = self.current_publish_lag_docs()
+            if lag_docs is not None:
+                self.event_writer.write(
+                    "visibility_lag_sample",
+                    lag_docs=lag_docs,
+                    budget_docs=self.lag_budget_docs,
+                )
+                if lag_docs <= self.lag_budget_docs:
+                    self.event_writer.write(
+                        "visibility_budget_met",
+                        lag_docs=lag_docs,
+                        budget_docs=self.lag_budget_docs,
+                    )
+                    return
+            self.capture_logs()
+            self.update_state_from_logs()
+            self.run_query_suite(final_pass=False)
+            time.sleep(self.args.query_cadence)
+        lag_docs = self.current_publish_lag_docs()
+        self.event_writer.write(
+            "visibility_budget_timeout",
+            lag_docs=lag_docs,
+            budget_docs=self.lag_budget_docs,
+            timeout_seconds=self.args.visibility_timeout,
+        )
+
     def duration_seconds(self, start_iso: str | None, end_iso: str | None) -> float | None:
         if not start_iso or not end_iso:
             return None
@@ -1482,6 +1518,7 @@ class BenchmarkHarness:
 
     def finalize_summary(self) -> dict[str, Any]:
         self.wait_for_replacement_publish()
+        self.wait_for_visibility_budget()
         self.capture_logs()
         parsed_events = self.parse_all_logs()
         nrt_events = [event for event in parsed_events if event["type"] == "nrt_publish"]
