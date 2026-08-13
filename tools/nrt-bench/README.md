@@ -76,6 +76,17 @@ tools/nrt-bench/run.sh --tier 1GB --storage-backend s3 \
   --s3-endpoint https://s3.us-east-1.amazonaws.com
 ```
 
+For an AWS profile-backed bucket:
+
+```bash
+aws sso login --profile kaldb-local-test
+tools/nrt-bench/run.sh --tier 100MB --storage-backend s3 \
+  --s3-bucket kaldb-local-test-886181574641-vrajat-20260710 \
+  --s3-region us-east-1 \
+  --profile kaldb-local-test \
+  --s3-prefix "nrt-bench/$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
 Useful overrides:
 
 ```bash
@@ -114,7 +125,10 @@ tools/nrt-bench/run.sh --tier 100MB --no-compose-up
 
 - does not start the local `minio` services
 - points every KalDB service at the value passed through `--s3-endpoint`
-- passes `--s3-bucket`, `--s3-region`, `--s3-access-key`, and `--s3-secret-key` through to KalDB
+- passes `--s3-bucket` and `--s3-region` through to KalDB
+- if `--s3-access-key` and `--s3-secret-key` are omitted, KalDB uses the AWS SDK default credential chain
+- `--profile` sets `AWS_PROFILE` for both the harness and KalDB containers
+- mounts the host AWS config directory read-only at `/root/.aws` in KalDB containers
 - uses the same endpoint and bucket for harness-side object listing
 - if you omit `--s3-endpoint`, object listing falls back to the AWS CLI when available
 
@@ -130,6 +144,13 @@ The flow is:
    - `KALDB_S3_REGION`
    - `KALDB_S3_ACCESS_KEY`
    - `KALDB_S3_SECRET_KEY`
+   - `AWS_PROFILE`
+   - `AWS_REGION`
+   - `AWS_DEFAULT_REGION`
+   - `AWS_SDK_LOAD_CONFIG`
+   - `AWS_SESSION_TOKEN`
+   - `AWS_ACCESS_KEY_ID`
+   - `AWS_SECRET_ACCESS_KEY`
    - `S3_PATH_PREFIX`
 4. `docker-compose.nrt-bench.yml` injects those into every KalDB container as:
    - `S3_ENDPOINT`
@@ -137,6 +158,13 @@ The flow is:
    - `S3_REGION`
    - `S3_ACCESS_KEY`
    - `S3_SECRET_KEY`
+   - `AWS_PROFILE`
+   - `AWS_REGION`
+   - `AWS_DEFAULT_REGION`
+   - `AWS_SDK_LOAD_CONFIG`
+   - `AWS_SESSION_TOKEN`
+   - `AWS_ACCESS_KEY_ID`
+   - `AWS_SECRET_ACCESS_KEY`
 5. KalDB reads those env vars through [config/config.yaml](/home/rajat/code/kaldb/config/config.yaml:34), which maps them into `s3Config`.
 6. The same harness value also controls whether the local MinIO services are started at all.
 

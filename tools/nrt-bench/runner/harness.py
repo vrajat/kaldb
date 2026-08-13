@@ -89,9 +89,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--s3-endpoint", default="")
     parser.add_argument("--s3-bucket", default="nrt-bench-bucket")
     parser.add_argument("--s3-region", default="us-east-1")
-    parser.add_argument("--s3-access-key", default="minioadmin")
-    parser.add_argument("--s3-secret-key", default="minioadmin")
+    parser.add_argument("--s3-access-key", default="")
+    parser.add_argument("--s3-secret-key", default="")
     parser.add_argument("--s3-prefix", default="")
+    parser.add_argument("--profile", dest="aws_profile", default=os.environ.get("AWS_PROFILE", ""))
     parser.add_argument("--astra-partition-count", type=int, default=2)
     parser.add_argument("--service-check-timeout", type=int, default=240)
     parser.add_argument("--kafka-ready-timeout", type=int, default=120)
@@ -677,11 +678,22 @@ class BenchmarkHarness:
         self.compose_env["KALDB_S3_ENDPOINT"] = self.kaldb_s3_endpoint
         self.compose_env["KALDB_S3_BUCKET"] = args.s3_bucket
         self.compose_env["KALDB_S3_REGION"] = args.s3_region
-        self.compose_env["KALDB_S3_ACCESS_KEY"] = args.s3_access_key
-        self.compose_env["KALDB_S3_SECRET_KEY"] = args.s3_secret_key
+        s3_access_key = args.s3_access_key
+        s3_secret_key = args.s3_secret_key
+        if args.storage_backend == "minio":
+            s3_access_key = s3_access_key or "minioadmin"
+            s3_secret_key = s3_secret_key or "minioadmin"
+        self.compose_env["KALDB_S3_ACCESS_KEY"] = s3_access_key
+        self.compose_env["KALDB_S3_SECRET_KEY"] = s3_secret_key
         self.compose_env["AWS_REGION"] = args.s3_region
-        self.compose_env["AWS_ACCESS_KEY_ID"] = args.s3_access_key
-        self.compose_env["AWS_SECRET_ACCESS_KEY"] = args.s3_secret_key
+        self.compose_env["AWS_DEFAULT_REGION"] = args.s3_region
+        self.compose_env["KALDB_AWS_CONFIG_DIR"] = str(Path.home() / ".aws")
+        self.compose_env["AWS_SDK_LOAD_CONFIG"] = "1"
+        if args.aws_profile:
+            self.compose_env["AWS_PROFILE"] = args.aws_profile
+        if s3_access_key and s3_secret_key:
+            self.compose_env["AWS_ACCESS_KEY_ID"] = s3_access_key
+            self.compose_env["AWS_SECRET_ACCESS_KEY"] = s3_secret_key
 
         if args.storage_backend == "s3" and not args.s3_endpoint and not shutil.which("aws"):
             raise ValueError(
@@ -927,7 +939,7 @@ class BenchmarkHarness:
         if not services:
             return
         self.log(logging.INFO, "Starting compose services: %s", ", ".join(services))
-        self.compose("up", "-d", *services)
+        self.compose("up", "-d", "--no-deps", *services)
         self.event_writer.write("compose_services_started", services=list(services))
 
     def wait_for_compose_http_service(self, service: str, url: str) -> None:
@@ -1170,7 +1182,7 @@ class BenchmarkHarness:
         self.compose("stop", "astra_index")
         self.event_writer.write("indexer_stopped", at=indexer_stopped_at)
         time.sleep(self.args.restart_grace_seconds)
-        self.compose("up", "-d", "astra_index_replacement")
+        self.compose("up", "-d", "--no-deps", "astra_index_replacement")
         replacement_started_at = self.wait_for_replacement_consumer_ready()
         with self.state.lock:
             self.state.replacement_started_at = replacement_started_at
