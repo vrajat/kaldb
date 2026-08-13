@@ -233,6 +233,39 @@ class BulkIngestKafkaProducerTest {
   }
 
   @Test
+  public void testNonTransactionalProducerCompletesWaitingRequestOnError() throws Exception {
+    bulkIngestKafkaProducer.stopAsync();
+    bulkIngestKafkaProducer.awaitTerminated(DEFAULT_START_STOP_DURATION);
+    System.clearProperty("astra.bulkIngest.useKafkaTransactions");
+    bulkIngestKafkaProducer =
+        new BulkIngestKafkaProducer(datasetMetadataStore, preprocessorConfig, meterRegistry);
+    bulkIngestKafkaProducer.startAsync();
+    bulkIngestKafkaProducer.awaitRunning(DEFAULT_START_STOP_DURATION);
+
+    Trace.Span doc = spy(Trace.Span.newBuilder().setId(ByteString.copyFromUtf8("error")).build());
+    when(doc.toByteArray()).thenThrow(new RuntimeException("serialization failure"));
+
+    BulkIngestRequest request =
+        bulkIngestKafkaProducer.submitRequest(Map.of(INDEX_NAME, List.of(doc)));
+    AtomicReference<BulkIngestResponse> response = new AtomicReference<>();
+
+    Thread.ofVirtual()
+        .start(
+            () -> {
+              try {
+                response.set(request.getResponse());
+              } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+              }
+            });
+
+    await().until(() -> response.get() != null);
+    assertThat(response.get().totalDocs()).isEqualTo(0);
+    assertThat(response.get().failedDocs()).isEqualTo(1);
+    assertThat(response.get().errorMsg()).contains("serialization failure");
+  }
+
+  @Test
   @Disabled("Flaky test")
   public void testDocumentInKafkaTransactionError() throws Exception {
     KafkaConsumer kafkaConsumer = getTestKafkaConsumer();
