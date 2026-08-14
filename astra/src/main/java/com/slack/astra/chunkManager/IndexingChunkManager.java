@@ -230,7 +230,7 @@ public class IndexingChunkManager<T> extends ChunkManagerBase<T> {
     try {
       currentChunk.publishNrtSnapshot(
           nrtSnapshotPublisher, activeNrtStartOffsetInclusive.getAsLong());
-      lastNrtPublishEpochMs = nowEpochMs;
+      lastNrtPublishEpochMs = Instant.now().toEpochMilli();
       lastNrtPublishedOffset = currentMaxOffset;
     } catch (RuntimeException e) {
       LOG.warn("Failed to publish NRT snapshot for chunk={}", currentChunk.info(), e);
