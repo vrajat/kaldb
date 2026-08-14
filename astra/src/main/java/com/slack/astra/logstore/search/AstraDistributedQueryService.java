@@ -362,6 +362,9 @@ public class AstraDistributedQueryService extends AstraQueryServiceBase implemen
       }
       if (cacheNodeHostedSearchMetadata.size() == 1) {
         return cacheNodeHostedSearchMetadata.get(0);
+      } else if (cacheNodeHostedSearchMetadata.isEmpty()) {
+        return queryableSearchMetadataNodes.get(
+            ThreadLocalRandom.current().nextInt(queryableSearchMetadataNodes.size()));
       } else {
         return cacheNodeHostedSearchMetadata.get(
             ThreadLocalRandom.current().nextInt(cacheNodeHostedSearchMetadata.size()));

@@ -195,6 +195,32 @@ public class BlobStore {
     }
   }
 
+  /**
+   * Downloads one object from the object store to a specific local file path.
+   *
+   * @param key Complete object key to download
+   * @param destinationFile Local file path to write
+   * @throws RuntimeException Thrown when the object cannot be downloaded
+   */
+  public void downloadFile(String key, Path destinationFile) {
+    assert key != null && !key.isEmpty();
+    assert destinationFile != null;
+
+    try {
+      transferManager
+          .download(
+              DownloadRequest.builder()
+                  .getObjectRequest(
+                      GetObjectRequest.builder().bucket(bucketName).key(addPathPrefix(key)).build())
+                  .responseTransformer(AsyncResponseTransformer.toFile(destinationFile))
+                  .build())
+          .completionFuture()
+          .get();
+    } catch (ExecutionException | InterruptedException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
   public byte[] getSchema(String chunkId) {
     try {
       return transferManager

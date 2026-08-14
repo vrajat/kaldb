@@ -5,10 +5,14 @@ import com.slack.astra.proto.config.AstraConfigs;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Duration;
+import java.util.Locale;
+import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.AwsCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
@@ -37,8 +41,17 @@ public class S3AsyncUtil {
         String secretKey = config.getS3SecretKey();
         AwsBasicCredentials awsBasicCredentials = AwsBasicCredentials.create(accessKey, secretKey);
         awsCredentialsProvider = StaticCredentialsProvider.create(awsBasicCredentials);
+        LOG.info(
+            "Using S3 credentials provider: StaticCredentialsProvider; resolvedCredentials={}",
+            describeResolvedCredentials(awsCredentialsProvider.resolveCredentials()));
       } else {
         awsCredentialsProvider = DefaultCredentialsProvider.create();
+        LOG.info(
+            "Using S3 credentials provider: DefaultCredentialsProvider; awsProfile={}; awsAccessKeyIdPresent={}; awsSessionTokenPresent={}; resolvedCredentials={}",
+            Optional.ofNullable(System.getenv("AWS_PROFILE")).orElse(""),
+            notNullOrEmpty(System.getenv("AWS_ACCESS_KEY_ID")),
+            notNullOrEmpty(System.getenv("AWS_SESSION_TOKEN")),
+            describeResolvedCredentials(awsCredentialsProvider.resolveCredentials()));
       }
 
       // default to 5% of the heap size for the max crt off-heap or 1GiB (min for client)
@@ -77,7 +90,15 @@ public class S3AsyncUtil {
       if (notNullOrEmpty(config.getS3EndPoint())) {
         String endpoint = config.getS3EndPoint();
         try {
-          s3AsyncClient.endpointOverride(new URI(endpoint));
+          URI endpointUri = new URI(endpoint);
+          s3AsyncClient.endpointOverride(endpointUri);
+          if (shouldUseS3CompatibleEndpointMode(endpointUri)) {
+            LOG.info(
+                "Enabling S3-compatible endpoint mode for '{}': forcePathStyle=true checksumValidationEnabled=false",
+                endpointUri);
+            s3AsyncClient.forcePathStyle(true);
+            s3AsyncClient.checksumValidationEnabled(false);
+          }
         } catch (URISyntaxException e) {
           throw new RuntimeException(e);
         }
@@ -90,5 +111,31 @@ public class S3AsyncUtil {
 
   static boolean notNullOrEmpty(String target) {
     return target != null && !target.isEmpty();
+  }
+
+  static String describeResolvedCredentials(AwsCredentials credentials) {
+    Optional<String> providerName = Optional.empty();
+    if (credentials instanceof AwsBasicCredentials basicCredentials) {
+      providerName = basicCredentials.providerName();
+    } else if (credentials instanceof AwsSessionCredentials sessionCredentials) {
+      providerName = sessionCredentials.providerName();
+    }
+
+    String credentialType = credentials.getClass().getSimpleName();
+    return providerName
+        .filter(S3AsyncUtil::notNullOrEmpty)
+        .map(name -> credentialType + "(providerName=" + name + ")")
+        .orElse(credentialType);
+  }
+
+  static boolean shouldUseS3CompatibleEndpointMode(URI endpointUri) {
+    String host = endpointUri.getHost();
+    if (!notNullOrEmpty(host)) {
+      return false;
+    }
+    String normalizedHost = host.toLowerCase(Locale.ROOT);
+    return !(normalizedHost.equals("s3.amazonaws.com")
+        || normalizedHost.endsWith(".amazonaws.com")
+        || normalizedHost.endsWith(".amazonaws.com.cn"));
   }
 }

@@ -64,6 +64,8 @@ class NrtBlobStoreTest {
   void testBlobKeyLayout() {
     NrtBlobStore nrtBlobStore = new NrtBlobStore(mock(BlobStore.class));
 
+    assertThat(NrtBlobStore.filesPath("0", "snapshot-1", 2))
+        .isEqualTo("nrt/v1/partitions/0/chunks/snapshot-1/generations/00000000000000000002/files");
     assertThat(nrtBlobStore.writeManifest(manifest()))
         .isEqualTo(
             "nrt/v1/partitions/0/chunks/snapshot-1/manifests/00000000000000000002-indexer-1.json");
@@ -108,6 +110,9 @@ class NrtBlobStoreTest {
 
   private static FileEntry fileEntry(String name) {
     return new FileEntry(
-        name, "nrt/v1/partitions/0/chunks/snapshot-1/files/" + name, 100, "checksum-" + name);
+        name,
+        "nrt/v1/partitions/0/chunks/snapshot-1/generations/00000000000000000002/files/" + name,
+        100,
+        "checksum-" + name);
   }
 }

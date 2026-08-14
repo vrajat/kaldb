@@ -42,6 +42,20 @@ size well before the 90-minute wall-clock chunk limit.
 cycle can fill after a slow cycle or temporary outage. The probe keeps draining
 the backlog over later cycles rather than dropping missed buckets.
 
+NRT benchmark harness
+=====================
+
+`tools/nrt-bench/` contains a Docker Compose benchmark harness for KalDB's
+cache-backed near-real-time live replication path. It runs an `http_logs`-style
+workload, captures per-run artifacts under `tools/nrt-bench/artifacts/`, and
+exercises indexer shutdown plus replacement while queries continue.
+
+Primary entrypoint:
+
+```bash
+tools/nrt-bench/run.sh --tier 100MB
+```
+
 Span generator tool
 ===================
 spangen is a cli tool that can generate spans from the command line. 

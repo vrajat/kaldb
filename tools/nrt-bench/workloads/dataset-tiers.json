@@ -1,0 +1,60 @@
+{
+  "tiers": {
+    "100MB": {
+      "target_bytes": 104857600,
+      "batch_size": 5000,
+      "throughput_bytes": 8000000,
+      "query_window_minutes": 15,
+      "lag_budget_docs": 400
+    },
+    "1GB": {
+      "target_bytes": 1073741824,
+      "batch_size": 250,
+      "throughput_bytes": 12000000,
+      "query_window_minutes": 20,
+      "lag_budget_docs": 1000
+    },
+    "5GB": {
+      "target_bytes": 5368709120,
+      "batch_size": 300,
+      "throughput_bytes": 16000000,
+      "query_window_minutes": 30,
+      "lag_budget_docs": 2500
+    },
+    "10GB": {
+      "target_bytes": 10737418240,
+      "batch_size": 350,
+      "throughput_bytes": 20000000,
+      "query_window_minutes": 45,
+      "lag_budget_docs": 5000
+    }
+  },
+  "field_distributions": {
+    "services": ["frontend", "checkout", "payments", "search", "inventory", "auth"],
+    "hosts": ["api-01", "api-02", "api-03", "worker-01", "worker-02", "edge-01"],
+    "methods": ["GET", "POST", "PUT", "DELETE"],
+    "paths": [
+      "/",
+      "/health",
+      "/api/cart",
+      "/api/checkout",
+      "/api/search",
+      "/api/orders",
+      "/api/login"
+    ],
+    "status_weights": {
+      "200": 78,
+      "201": 7,
+      "204": 4,
+      "400": 3,
+      "404": 3,
+      "429": 1,
+      "500": 2,
+      "502": 1,
+      "503": 1
+    },
+    "hot_service": "checkout",
+    "hot_host": "api-01",
+    "message_phrase": "nrt bench synthetic phrase"
+  }
+}

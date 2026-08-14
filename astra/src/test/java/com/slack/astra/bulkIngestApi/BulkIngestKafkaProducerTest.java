@@ -24,6 +24,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.curator.test.TestingServer;
 import org.apache.curator.x.async.AsyncCuratorFramework;
@@ -202,6 +203,66 @@ class BulkIngestKafkaProducerTest {
     assertThat(
             MetricsUtil.getTimerCount(BulkIngestKafkaProducer.KAFKA_RESTART_COUNTER, meterRegistry))
         .isEqualTo(1);
+  }
+
+  @Test
+  public void testBulkIngestRequestCanConsumeResponseAfterProducerWinsRace() {
+    Trace.Span doc = Trace.Span.newBuilder().setId(ByteString.copyFromUtf8("race")).build();
+    BulkIngestRequest request = new BulkIngestRequest(Map.of(INDEX_NAME, List.of(doc)));
+    BulkIngestResponse expected = new BulkIngestResponse(1, 0, "");
+
+    assertThat(request.setResponse(expected)).isTrue();
+
+    AtomicReference<BulkIngestResponse> response = new AtomicReference<>();
+    AtomicBoolean interrupted = new AtomicBoolean(false);
+    Thread consumer =
+        Thread.ofVirtual()
+            .start(
+                () -> {
+                  try {
+                    response.set(request.getResponse());
+                  } catch (InterruptedException e) {
+                    interrupted.set(true);
+                  }
+                });
+
+    await().until(() -> response.get() != null || interrupted.get());
+    assertThat(interrupted.get()).isFalse();
+    assertThat(response.get()).isEqualTo(expected);
+    assertThat(consumer.isAlive()).isFalse();
+  }
+
+  @Test
+  public void testNonTransactionalProducerCompletesWaitingRequestOnError() throws Exception {
+    bulkIngestKafkaProducer.stopAsync();
+    bulkIngestKafkaProducer.awaitTerminated(DEFAULT_START_STOP_DURATION);
+    System.clearProperty("astra.bulkIngest.useKafkaTransactions");
+    bulkIngestKafkaProducer =
+        new BulkIngestKafkaProducer(datasetMetadataStore, preprocessorConfig, meterRegistry);
+    bulkIngestKafkaProducer.startAsync();
+    bulkIngestKafkaProducer.awaitRunning(DEFAULT_START_STOP_DURATION);
+
+    Trace.Span doc = spy(Trace.Span.newBuilder().setId(ByteString.copyFromUtf8("error")).build());
+    when(doc.toByteArray()).thenThrow(new RuntimeException("serialization failure"));
+
+    BulkIngestRequest request =
+        bulkIngestKafkaProducer.submitRequest(Map.of(INDEX_NAME, List.of(doc)));
+    AtomicReference<BulkIngestResponse> response = new AtomicReference<>();
+
+    Thread.ofVirtual()
+        .start(
+            () -> {
+              try {
+                response.set(request.getResponse());
+              } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+              }
+            });
+
+    await().until(() -> response.get() != null);
+    assertThat(response.get().totalDocs()).isEqualTo(0);
+    assertThat(response.get().failedDocs()).isEqualTo(1);
+    assertThat(response.get().errorMsg()).contains("serialization failure");
   }
 
   @Test

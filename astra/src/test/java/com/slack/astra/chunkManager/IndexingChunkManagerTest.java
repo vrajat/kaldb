@@ -27,6 +27,10 @@ import static org.assertj.core.api.AssertionsForClassTypes.assertThatExceptionOf
 import static org.assertj.core.api.AssertionsForClassTypes.assertThatThrownBy;
 import static org.assertj.core.api.AssertionsForClassTypes.catchThrowable;
 import static org.awaitility.Awaitility.await;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.spy;
 
 import brave.Tracing;
 import com.adobe.testing.s3mock.junit5.S3MockExtension;
@@ -562,6 +566,55 @@ public class IndexingChunkManagerTest {
     String manifestJson = blobStore.readFileData(liveSnapshot.snapshotPath, false);
     assertThat(manifestJson).contains("\"startOffsetInclusive\":42");
     assertThat(manifestJson).contains("\"maxIndexedOffsetInclusive\":42");
+  }
+
+  @Test
+  public void testNrtPublishIntervalStartsAfterPublishCompletes() throws Exception {
+    BlobStore slowBlobStore = spy(blobStore);
+    doAnswer(
+            invocation -> {
+              Thread.sleep(1200);
+              return invocation.callRealMethod();
+            })
+        .when(slowBlobStore)
+        .upload(anyString(), any());
+
+    ChunkRollOverStrategy chunkRollOverStrategy =
+        new DiskOrMessageCountBasedRolloverStrategy(
+            metricsRegistry, 10 * 1024 * 1024 * 1024L, 1000000L);
+    AstraConfigs.IndexerConfig indexerConfig =
+        AstraConfigUtil.makeIndexerConfig(TEST_PORT, 1000, 100).toBuilder()
+            .setNrtEnabled(true)
+            .setLuceneConfig(
+                AstraConfigs.LuceneConfig.newBuilder()
+                    .setCommitDurationSecs(1)
+                    .setRefreshDurationSecs(10)
+                    .setEnableFullTextSearch(true)
+                    .build())
+            .build();
+    initChunkManager(
+        chunkRollOverStrategy,
+        slowBlobStore,
+        MoreExecutors.newDirectExecutorService(),
+        indexerConfig);
+
+    Trace.Span firstMessage = SpanUtil.makeSpan(1);
+    chunkManager.addMessage(
+        firstMessage, firstMessage.toString().length(), TEST_KAFKA_PARTITION_ID, 42);
+
+    SnapshotMetadata firstSnapshot =
+        fetchLiveSnapshot(AstraMetadataTestUtils.listSyncUncached(snapshotMetadataStore)).get(0);
+    assertThat(firstSnapshot.snapshotGeneration).isEqualTo(1);
+    assertThat(firstSnapshot.maxOffset).isEqualTo(42);
+
+    Trace.Span secondMessage = SpanUtil.makeSpan(2);
+    chunkManager.addMessage(
+        secondMessage, secondMessage.toString().length(), TEST_KAFKA_PARTITION_ID, 43);
+
+    SnapshotMetadata secondSnapshot =
+        fetchLiveSnapshot(AstraMetadataTestUtils.listSyncUncached(snapshotMetadataStore)).get(0);
+    assertThat(secondSnapshot.snapshotGeneration).isEqualTo(1);
+    assertThat(secondSnapshot.maxOffset).isEqualTo(42);
   }
 
   private void testChunkManagerSearch(

@@ -338,6 +338,43 @@ public class AstraDistributedQueryServiceTest {
   }
 
   @Test
+  public void testMultipleLiveSearchNodesWithoutCache() {
+    String indexName = "testIndex";
+    DatasetPartitionMetadata partition = new DatasetPartitionMetadata(1, 300, List.of("1"));
+    DatasetMetadata datasetMetadata =
+        new DatasetMetadata(indexName, "testOwner", 1, List.of(partition), indexName);
+    datasetMetadataStore.createSync(datasetMetadata);
+    await().until(() -> AstraMetadataTestUtils.listSyncUncached(datasetMetadataStore).size() == 1);
+
+    Instant chunkCreationTime = Instant.ofEpochMilli(100);
+    Instant chunkEndTime = Instant.ofEpochMilli(200);
+    createIndexerZKMetadata(chunkCreationTime, chunkEndTime, "1", indexer1SearchContext);
+    SearchMetadata firstLiveMetadata =
+        AstraMetadataTestUtils.listSyncUncached(searchMetadataStore).iterator().next();
+    searchMetadataStore.createSync(
+        toSearchMetadata(firstLiveMetadata.snapshotName, indexer2SearchContext));
+    await().until(() -> AstraMetadataTestUtils.listSyncUncached(searchMetadataStore).size() == 2);
+
+    Map<String, List<String>> searchNodes =
+        getSearchNodesToQuery(
+            snapshotMetadataStore,
+            searchMetadataStore,
+            datasetMetadataStore,
+            chunkCreationTime.toEpochMilli(),
+            chunkEndTime.toEpochMilli(),
+            indexName);
+
+    assertThat(searchNodes).hasSize(1);
+    String searchNodeUrl = searchNodes.keySet().iterator().next();
+    assertThat(
+            searchNodeUrl.equals(indexer1SearchContext.toString())
+                || searchNodeUrl.equals(indexer2SearchContext.toString()))
+        .isTrue();
+    assertThat(searchNodes.values().iterator().next())
+        .containsExactly(firstLiveMetadata.snapshotName.substring(5));
+  }
+
+  @Test
   // snaphost1[100-200] -> hosted on indexer1 , cache1 , cache2
   // snapshot2[51-150] -> cache2
   // snapshot3[151-250] - cache1

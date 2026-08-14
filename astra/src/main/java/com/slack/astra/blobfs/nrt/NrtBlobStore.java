@@ -24,8 +24,10 @@ public class NrtBlobStore {
         "%s/%s/partitions/%s/chunks/%s", NRT_ROOT, NRT_VERSION, partitionId, snapshotId);
   }
 
-  static String filesPath(String partitionId, String snapshotId) {
-    return String.format("%s/files", chunkPrefix(partitionId, snapshotId));
+  static String filesPath(String partitionId, String snapshotId, long generation) {
+    checkArgument(generation > 0, "generation must be positive");
+    return String.format(
+        "%s/generations/%020d/files", chunkPrefix(partitionId, snapshotId), generation);
   }
 
   static String manifestPath(

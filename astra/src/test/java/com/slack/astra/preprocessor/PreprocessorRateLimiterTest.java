@@ -234,6 +234,45 @@ public class PreprocessorRateLimiterTest {
   }
 
   @Test
+  public void shouldTreatZeroThroughputDatasetAsDisabledWithoutThrowing() {
+    MeterRegistry meterRegistry = new SimpleMeterRegistry();
+    PreprocessorRateLimiter rateLimiter = new PreprocessorRateLimiter(meterRegistry, 1, 1, false);
+
+    String name = "zeroThroughput";
+    Trace.Span span =
+        Trace.Span.newBuilder()
+            .addTags(Trace.KeyValue.newBuilder().setKey(SERVICE_NAME_KEY).setVStr(name).build())
+            .build();
+
+    DatasetMetadata datasetMetadata =
+        new DatasetMetadata(
+            name,
+            name,
+            0,
+            List.of(new DatasetPartitionMetadata(100, Long.MAX_VALUE, List.of("0"))),
+            DatasetMetadata.MATCH_ALL_SERVICE);
+
+    BiPredicate<String, List<Trace.Span>> predicate =
+        rateLimiter.createBulkIngestRateLimiter(List.of(datasetMetadata));
+
+    assertThat(predicate.test("key", List.of(span))).isFalse();
+    assertThat(
+            meterRegistry
+                .get(RATE_LIMIT_BYTES)
+                .tag("service", datasetMetadata.getName())
+                .gauge()
+                .value())
+        .isEqualTo(0);
+    assertThat(
+            meterRegistry
+                .get(MESSAGES_DROPPED)
+                .tag("reason", String.valueOf(PreprocessorRateLimiter.MessageDropReason.OVER_LIMIT))
+                .counter()
+                .count())
+        .isEqualTo(1);
+  }
+
+  @Test
   public void shouldApplyScaledRateLimitWithAllServices() throws InterruptedException {
     MeterRegistry meterRegistry = new SimpleMeterRegistry();
     int preprocessorCount = 2;

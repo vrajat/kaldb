@@ -1,0 +1,238 @@
+{
+  "queries": [
+    {
+      "name": "recent_service_host",
+      "kind": "search",
+      "endpoint": "/{dataset}/_search",
+      "body": {
+        "size": 25,
+        "sort": [
+          {
+            "@timestamp": {
+              "order": "desc"
+            }
+          }
+        ],
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "term": {
+                  "service": "{service}"
+                }
+              },
+              {
+                "term": {
+                  "host": "{host}"
+                }
+              },
+              {
+                "term": {
+                  "run_id": "{run_id}"
+                }
+              },
+              {
+                "range": {
+                  "@timestamp": {
+                    "gte": "{time_gte}",
+                    "lte": "{time_lte}"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "error_filter",
+      "kind": "search",
+      "endpoint": "/{dataset}/_search",
+      "body": {
+        "size": 25,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "term": {
+                  "run_id": "{run_id}"
+                }
+              },
+              {
+                "range": {
+                  "@timestamp": {
+                    "gte": "{time_gte}",
+                    "lte": "{time_lte}"
+                  }
+                }
+              },
+              {
+                "range": {
+                  "status": {
+                    "gte": 500
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "service_terms",
+      "kind": "search",
+      "endpoint": "/{dataset}/_search",
+      "body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "term": {
+                  "run_id": "{run_id}"
+                }
+              },
+              {
+                "range": {
+                  "@timestamp": {
+                    "gte": "{time_gte}",
+                    "lte": "{time_lte}"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "aggs": {
+          "services": {
+            "terms": {
+              "field": "service",
+              "size": 10
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "recent_histogram",
+      "kind": "search",
+      "endpoint": "/{dataset}/_search",
+      "body": {
+        "size": 0,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "term": {
+                  "run_id": "{run_id}"
+                }
+              },
+              {
+                "range": {
+                  "@timestamp": {
+                    "gte": "{time_gte}",
+                    "lte": "{time_lte}"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "aggs": {
+          "events_per_minute": {
+            "date_histogram": {
+              "field": "@timestamp",
+              "fixed_interval": "1m",
+              "min_doc_count": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "message_phrase",
+      "kind": "search",
+      "endpoint": "/{dataset}/_search",
+      "body": {
+        "size": 25,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "term": {
+                  "run_id": "{run_id}"
+                }
+              },
+              {
+                "range": {
+                  "@timestamp": {
+                    "gte": "{time_gte}",
+                    "lte": "{time_lte}"
+                  }
+                }
+              }
+            ],
+            "must": [
+              {
+                "match": {
+                  "message": "{message_phrase}"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "exact_doc_lookup",
+      "kind": "search",
+      "endpoint": "/{dataset}/_search",
+      "body": {
+        "size": 1,
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "term": {
+                  "run_id": "{run_id}"
+                }
+              },
+              {
+                "term": {
+                  "seq_id": "{seq_id}"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "latest_visible_seq",
+      "kind": "search",
+      "endpoint": "/{dataset}/_search",
+      "body": {
+        "size": 1,
+        "sort": [
+          {
+            "seq_id": {
+              "order": "desc"
+            }
+          }
+        ],
+        "_source": ["seq_id", "@timestamp", "host", "service"],
+        "query": {
+          "bool": {
+            "filter": [
+              {
+                "term": {
+                  "run_id": "{run_id}"
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
